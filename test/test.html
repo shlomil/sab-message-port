@@ -1,0 +1,1294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SABPipe Tests</title>
+  <style>
+    body {
+      font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+      background: #1a1a2e;
+      color: #eee;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    h1 { color: #00d4ff; margin-bottom: 5px; }
+    h2 { color: #7b68ee; margin-top: 15px; margin-bottom: 7px; font-size: 1.1em; }
+    .pass { color: #00ff88; }
+    .fail { color: #ff4757; }
+    .perf { color: #ffa502; }
+    .info { color: #747d8c; }
+    .result { margin: 0 0; padding-left: 20px; }
+    #output { 
+      line-height: 0.95;
+      /*white-space: pre-wrap; */
+     }
+    .summary {
+      margin-top: 20px;
+      padding: 15px;
+      border-radius: 8px;
+      font-size: 1.2em;
+    }
+    .summary.pass { background: rgba(0, 255, 136, 0.1); border: 1px solid #00ff88; }
+    .summary.fail { background: rgba(255, 71, 87, 0.1); border: 1px solid #ff4757; }
+  </style>
+</head>
+<body>
+  <h1>SABPipe Tests</h1>
+  <p class="info">High-level SharedArrayBuffer communication with buffered queues</p>
+  <div id="output"></div>
+
+  <script type="module">
+    import { SABPipe, SABMessagePort } from '../src/SABMessagePort.js';
+
+    // ════════════════════════════════════════════════════════════════
+    // Test Framework
+    // ════════════════════════════════════════════════════════════════
+
+    const output = document.getElementById('output');
+    let passed = 0;
+    let failed = 0;
+
+    function log(html) {
+      output.innerHTML += html + '\n';
+    }
+
+    function group(name) {
+      log(`<h2>[ ${name} ]</h2>`);
+    }
+
+    function test(name, condition) {
+      if (condition) {
+        passed++;
+        log(`<div class="result pass">PASS ${name}</div>`);
+      } else {
+        failed++;
+        log(`<div class="result fail">FAIL ${name}</div>`);
+      }
+    }
+
+    function assertEqual(name, actual, expected) {
+      const match = JSON.stringify(actual) === JSON.stringify(expected);
+      if (match) {
+        passed++;
+        log(`<div class="result pass">PASS ${name}</div>`);
+      } else {
+        failed++;
+        log(`<div class="result fail">FAIL ${name} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}</div>`);
+      }
+    }
+
+    function perf(name, value) {
+      log(`<div class="result perf">PERF ${name}: ${value}</div>`);
+    }
+
+    function summary() {
+      const total = passed + failed;
+      const cls = failed === 0 ? 'pass' : 'fail';
+      log(`<div class="summary ${cls}">Tests: ${passed}/${total} passed</div>`);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Worker Helper
+    // ════════════════════════════════════════════════════════════════
+
+    function createWorker() {
+      return new Worker('./worker.js', { type: 'module' });
+    }
+
+    async function waitForWorkerReady(worker) {
+      return new Promise((resolve) => {
+        const handler = (e) => {
+          if (e.data.status === 'ready') {
+            worker.removeEventListener('message', handler);
+            resolve();
+          }
+        };
+        worker.addEventListener('message', handler);
+      });
+    }
+
+    async function runWorkerTest(worker, testName, sab, options = {}) {
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error(`Timeout: ${testName}`));
+        }, options.testTimeout || 5000);
+
+        const handler = (e) => {
+          if (e.data.result !== undefined) {
+            clearTimeout(timeout);
+            worker.removeEventListener('message', handler);
+            resolve(e.data.result);
+          } else if (e.data.status === 'error') {
+            clearTimeout(timeout);
+            worker.removeEventListener('message', handler);
+            reject(new Error(e.data.error));
+          }
+        };
+        worker.addEventListener('message', handler);
+        worker.postMessage({ test: testName, sab, options });
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Tests
+    // ════════════════════════════════════════════════════════════════
+
+    async function runTests() {
+      log('<div class="info">Starting tests...</div>');
+
+      // ─────────────────────────────────────────────────────────────
+      group('Construction');
+      // ─────────────────────────────────────────────────────────────
+
+      const sab1 = new SharedArrayBuffer(131072);
+      const writer1 = new SABPipe('w', sab1);
+      const reader1 = new SABPipe('r', sab1);
+
+      test('writer role set correctly', writer1.isWriter === true);
+      test('writer isReader is false', writer1.isReader === false);
+      test('reader role set correctly', reader1.isReader === true);
+      test('reader isWriter is false', reader1.isWriter === false);
+
+      const writer2 = new SABPipe('w');
+      test('default SAB size is 128KB', writer2._sab.byteLength === 131072);
+
+      let roleError = null;
+      try {
+        new SABPipe('x');
+      } catch (err) {
+        roleError = err;
+      }
+      test('invalid role throws', roleError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('Role Enforcement');
+      // ─────────────────────────────────────────────────────────────
+
+      const sab2 = new SharedArrayBuffer(131072);
+      const writer3 = new SABPipe('w', sab2);
+      const reader3 = new SABPipe('r', sab2);
+
+      let writerReadError = null;
+      try {
+        writer3.tryRead();
+      } catch (err) {
+        writerReadError = err;
+      }
+      test('writer cannot call tryRead()', writerReadError !== null);
+
+      let writerAsyncReadError = null;
+      try {
+        await writer3.asyncRead();
+      } catch (err) {
+        writerAsyncReadError = err;
+      }
+      test('writer cannot call asyncRead()', writerAsyncReadError !== null);
+
+      let readerWriteError = null;
+      try {
+        reader3.postMessage({ test: 1 });
+      } catch (err) {
+        readerWriteError = err;
+      }
+      test('reader cannot call postMessage()', readerWriteError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('Basic Write/Read');
+      // ─────────────────────────────────────────────────────────────
+
+      const worker1 = createWorker();
+      await waitForWorkerReady(worker1);
+
+      const sab3 = new SharedArrayBuffer(131072);
+      const writer4 = new SABPipe('w', sab3);
+
+      const workerPromise1 = runWorkerTest(worker1, 'test_read_echo', sab3);
+      await new Promise(r => setTimeout(r, 50));
+
+      await writer4.postMessage({ message: 'hello', num: 42 });
+      const result1 = await workerPromise1;
+
+      test('worker received message', result1.received !== null);
+      assertEqual('message content correct', result1.received?.message, 'hello');
+      assertEqual('message number correct', result1.received?.num, 42);
+      test('response from worker', result1.from === 'worker');
+
+      worker1.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('tryRead');
+      // ─────────────────────────────────────────────────────────────
+
+      // tryRead when no data
+      const worker2a = createWorker();
+      await waitForWorkerReady(worker2a);
+      const sab4a = new SharedArrayBuffer(131072);
+      const result4a = await runWorkerTest(worker2a, 'test_try_read_empty', sab4a);
+      test('tryRead returns null when no data', result4a.wasNull === true);
+      worker2a.terminate();
+
+      // tryRead when data ready
+      const worker2b = createWorker();
+      await waitForWorkerReady(worker2b);
+      const sab4b = new SharedArrayBuffer(131072);
+      const writer4b = new SABPipe('w', sab4b);
+      const workerPromise4b = runWorkerTest(worker2b, 'test_try_read_ready', sab4b);
+      await new Promise(r => setTimeout(r, 50));
+      await writer4b.postMessage({ test: 'data' });
+      const result4b = await workerPromise4b;
+      test('tryRead returns data when ready', result4b.received !== null);
+      assertEqual('tryRead data correct', result4b.received?.test, 'data');
+      worker2b.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Timeout');
+      // ─────────────────────────────────────────────────────────────
+
+      const worker3 = createWorker();
+      await waitForWorkerReady(worker3);
+      const sab5 = new SharedArrayBuffer(131072);
+      const result5 = await runWorkerTest(worker3, 'test_read_timeout', sab5, { timeout: 100, testTimeout: 2000 });
+      test('read with timeout returns null', result5.received === null);
+      test('timeout took reasonable time', result5.elapsed >= 80 && result5.elapsed < 300);
+      worker3.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Multiple Messages');
+      // ─────────────────────────────────────────────────────────────
+
+      const worker4 = createWorker();
+      await waitForWorkerReady(worker4);
+      const sab6 = new SharedArrayBuffer(131072);
+      const writer6 = new SABPipe('w', sab6);
+
+      const workerPromise6 = runWorkerTest(worker4, 'test_read_multiple', sab6, { count: 3, testTimeout: 5000 });
+      await new Promise(r => setTimeout(r, 50));
+
+      for (let i = 0; i < 3; i++) {
+        await writer6.postMessage({ id: i, data: `message-${i}` });
+      }
+
+      const result6 = await workerPromise6;
+      test('received all 3 messages', result6.messages?.length === 3);
+      test('messages in correct order', result6.messages?.every((m, i) => m.id === i));
+      worker4.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Multipart (Large Payload)');
+      // ─────────────────────────────────────────────────────────────
+
+      const worker5 = createWorker();
+      await waitForWorkerReady(worker5);
+      const sab7 = new SharedArrayBuffer(131072);
+      const writer7 = new SABPipe('w', sab7);
+
+      const bigArray = [];
+      for (let i = 0; i < 50000; i++) bigArray.push(i);
+
+      const workerPromise7 = runWorkerTest(worker5, 'test_read_multipart', sab7, { testTimeout: 30000 });
+      await new Promise(r => setTimeout(r, 50));
+
+      await writer7.postMessage(bigArray);
+      const result7 = await workerPromise7;
+
+      test('worker received multipart', result7.received === true);
+      assertEqual('multipart length correct', result7.length, 50000);
+      assertEqual('multipart first item', result7.first, 0);
+      assertEqual('multipart last item', result7.last, 49999);
+      worker5.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Disposal');
+      // ─────────────────────────────────────────────────────────────
+
+      const sab8 = new SharedArrayBuffer(131072);
+      const writer8 = new SABPipe('w', sab8);
+      const reader8 = new SABPipe('r', sab8);
+
+      test('isDisposed false before destroy', !writer8.isDisposed());
+      writer8.destroy();
+      test('isDisposed true after destroy', writer8.isDisposed());
+      test('reader sees disposed', reader8.isDisposed());
+      test('i32 is null after destroy', writer8.i32 === null);
+
+      let doubleDestroyError = null;
+      try {
+        writer8.destroy();
+      } catch (err) {
+        doubleDestroyError = err;
+      }
+      test('double destroy does not throw', doubleDestroyError === null);
+
+      // postMessage() after destroy should throw
+      let writeAfterDestroyError = null;
+      try {
+        await writer8.postMessage({ test: 1 });
+      } catch (err) {
+        writeAfterDestroyError = err;
+      }
+      test('postMessage() throws after destroy', writeAfterDestroyError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('Dispose While Waiting');
+      // ─────────────────────────────────────────────────────────────
+
+      const worker6 = createWorker();
+      await waitForWorkerReady(worker6);
+      const sab9 = new SharedArrayBuffer(131072);
+      const writer9 = new SABPipe('w', sab9);
+
+      const workerPromise9 = runWorkerTest(worker6, 'test_read_disposed', sab9, { testTimeout: 3000 });
+      await new Promise(r => setTimeout(r, 100));
+
+      writer9.destroy();
+      const result9 = await workerPromise9;
+
+      test('read throws when disposed', result9.threw === true);
+      test('error message mentions disposed', result9.error?.includes('disposed'));
+      worker6.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Async Read');
+      // ─────────────────────────────────────────────────────────────
+
+      // Basic asyncRead — worker writes, main reads with asyncRead
+      const workerAR1 = createWorker();
+      await waitForWorkerReady(workerAR1);
+      const sabAR1 = new SharedArrayBuffer(131072);
+      const readerAR1 = new SABPipe('r', sabAR1);
+      const readPromiseAR1 = readerAR1.asyncRead(5000);
+      const workerPromiseAR1 = runWorkerTest(workerAR1, 'test_async_write_single', sabAR1, {
+        message: { greeting: 'hello-async', num: 99 }, testTimeout: 5000
+      });
+      const msgAR1 = await readPromiseAR1;
+      await workerPromiseAR1;
+      test('asyncRead received message', msgAR1 !== null);
+      assertEqual('asyncRead message content', msgAR1?.greeting, 'hello-async');
+      assertEqual('asyncRead message number', msgAR1?.num, 99);
+      workerAR1.terminate();
+
+      // asyncRead timeout — no writer, returns null
+      const sabAR2 = new SharedArrayBuffer(131072);
+      const readerAR2 = new SABPipe('r', sabAR2);
+      const arStart = performance.now();
+      const msgAR2 = await readerAR2.asyncRead(100);
+      const arElapsed = performance.now() - arStart;
+      test('asyncRead timeout returns null', msgAR2 === null);
+      test('asyncRead timeout reasonable time', arElapsed >= 80 && arElapsed < 300);
+
+      // asyncRead multiple — worker writes 3, main reads 3
+      const workerAR3 = createWorker();
+      await waitForWorkerReady(workerAR3);
+      const sabAR3 = new SharedArrayBuffer(131072);
+      const readerAR3 = new SABPipe('r', sabAR3);
+      const readStartAR3 = readerAR3.asyncRead(5000);
+      const workerPromiseAR3 = runWorkerTest(workerAR3, 'test_async_write_multiple', sabAR3, {
+        count: 3, testTimeout: 10000
+      });
+      const arMsgs = [await readStartAR3];
+      for (let i = 1; i < 3; i++) {
+        arMsgs.push(await readerAR3.asyncRead(5000));
+      }
+      await workerPromiseAR3;
+      test('asyncRead received all 3', arMsgs.length === 3 && arMsgs.every(m => m !== null));
+      test('asyncRead correct order', arMsgs.every((m, i) => m.id === i));
+      workerAR3.terminate();
+
+      // asyncRead multipart — worker writes large payload
+      const workerAR4 = createWorker();
+      await waitForWorkerReady(workerAR4);
+      const sabAR4 = new SharedArrayBuffer(131072);
+      const readerAR4 = new SABPipe('r', sabAR4);
+      const readPromiseAR4 = readerAR4.asyncRead(30000);
+      const workerPromiseAR4 = runWorkerTest(workerAR4, 'test_async_write_multipart', sabAR4, {
+        size: 50000, testTimeout: 30000
+      });
+      const msgAR4 = await readPromiseAR4;
+      await workerPromiseAR4;
+      test('asyncRead multipart received', msgAR4 !== null);
+      assertEqual('asyncRead multipart length', msgAR4?.length, 50000);
+      assertEqual('asyncRead multipart first', msgAR4?.[0], 0);
+      assertEqual('asyncRead multipart last', msgAR4?.[49999], 49999);
+      workerAR4.terminate();
+
+      // asyncRead disposed — worker disposes while main is reading
+      const workerAR5 = createWorker();
+      await waitForWorkerReady(workerAR5);
+      const sabAR5 = new SharedArrayBuffer(131072);
+      const readerAR5 = new SABPipe('r', sabAR5);
+      const readPromiseAR5 = readerAR5.asyncRead(5000);
+      const workerPromiseAR5 = runWorkerTest(workerAR5, 'test_async_dispose', sabAR5, {
+        delay: 100, testTimeout: 5000
+      });
+      let arThrew = false;
+      let arError = '';
+      try {
+        await readPromiseAR5;
+      } catch (err) {
+        arThrew = true;
+        arError = err.message;
+      }
+      await workerPromiseAR5;
+      test('asyncRead throws when disposed', arThrew === true);
+      test('asyncRead error mentions disposed', arError.includes('disposed'));
+      workerAR5.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('onmessage Handler');
+      // ─────────────────────────────────────────────────────────────
+
+      // writer cannot set onmessage
+      const sabOM0 = new SharedArrayBuffer(131072);
+      const writerOM0 = new SABPipe('w', sabOM0);
+      let writerOnmsgError = null;
+      try {
+        writerOM0.onmessage = () => {};
+      } catch (err) {
+        writerOnmsgError = err;
+      }
+      test('writer cannot set onmessage', writerOnmsgError !== null);
+
+      // basic onmessage delivery — worker writes, main receives via onmessage
+      const workerOM1 = createWorker();
+      await waitForWorkerReady(workerOM1);
+      const sabOM1 = new SharedArrayBuffer(131072);
+      const readerOM1 = new SABPipe('r', sabOM1);
+      const omReadPromise1 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage timeout')), 5000);
+        readerOM1.onmessage = (e) => {
+          clearTimeout(timeout);
+          readerOM1.onmessage = null;
+          resolve(e.data);
+        };
+      });
+      const omWorkerPromise1 = runWorkerTest(workerOM1, 'test_async_write_single', sabOM1, {
+        message: { hello: 'onmessage' }, testTimeout: 5000
+      });
+      const omMsg1 = await omReadPromise1;
+      await omWorkerPromise1;
+      test('onmessage received message', omMsg1 !== null);
+      assertEqual('onmessage message content', omMsg1?.hello, 'onmessage');
+      workerOM1.terminate();
+
+      // onmessage multiple messages — worker writes 5, handler collects all
+      const workerOM2 = createWorker();
+      await waitForWorkerReady(workerOM2);
+      const sabOM2 = new SharedArrayBuffer(131072);
+      const readerOM2 = new SABPipe('r', sabOM2);
+      const omReadPromise2 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage multi timeout')), 10000);
+        const collected = [];
+        readerOM2.onmessage = (e) => {
+          collected.push(e.data);
+          if (collected.length >= 5) {
+            clearTimeout(timeout);
+            readerOM2.onmessage = null;
+            resolve(collected);
+          }
+        };
+      });
+      const omWorkerPromise2 = runWorkerTest(workerOM2, 'test_async_write_multiple', sabOM2, {
+        count: 5, testTimeout: 10000
+      });
+      const omMsgs2 = await omReadPromise2;
+      await omWorkerPromise2;
+      test('onmessage received all 5', omMsgs2.length === 5);
+      test('onmessage correct order', omMsgs2.every((m, i) => m.id === i));
+      workerOM2.terminate();
+
+      // onmessage multipart — worker writes large payload
+      const workerOM3 = createWorker();
+      await waitForWorkerReady(workerOM3);
+      const sabOM3 = new SharedArrayBuffer(131072);
+      const readerOM3 = new SABPipe('r', sabOM3);
+      const omReadPromise3 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage multipart timeout')), 30000);
+        readerOM3.onmessage = (e) => {
+          clearTimeout(timeout);
+          readerOM3.onmessage = null;
+          resolve(e.data);
+        };
+      });
+      const omWorkerPromise3 = runWorkerTest(workerOM3, 'test_async_write_multipart', sabOM3, {
+        size: 50000, testTimeout: 30000
+      });
+      const omMsg3 = await omReadPromise3;
+      await omWorkerPromise3;
+      test('onmessage multipart received', omMsg3 !== null);
+      assertEqual('onmessage multipart length', omMsg3?.length, 50000);
+      workerOM3.terminate();
+
+      // mutual exclusion — asyncRead() throws while onmessage is active
+      const sabOM4 = new SharedArrayBuffer(131072);
+      const readerOM4 = new SABPipe('r', sabOM4);
+      readerOM4.onmessage = () => {};
+      let asyncReadWhileOnmsgError = null;
+      try {
+        await readerOM4.asyncRead(0);
+      } catch (err) {
+        asyncReadWhileOnmsgError = err;
+      }
+      readerOM4.onmessage = null;
+      test('asyncRead() throws while onmessage active', asyncReadWhileOnmsgError !== null);
+
+      // setting null stops delivery
+      const workerOM5 = createWorker();
+      await waitForWorkerReady(workerOM5);
+      const sabOM5 = new SharedArrayBuffer(131072);
+      const readerOM5 = new SABPipe('r', sabOM5);
+      const omReadPromise5 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage null-stop timeout')), 10000);
+        const collected = [];
+        readerOM5.onmessage = (e) => {
+          collected.push(e.data);
+          if (collected.length >= 2) {
+            readerOM5.onmessage = null;
+            clearTimeout(timeout);
+            resolve(collected);
+          }
+        };
+      });
+      runWorkerTest(workerOM5, 'test_async_write_multiple', sabOM5, {
+        count: 5, testTimeout: 3000
+      }).catch(() => {});
+      const omResult5 = await omReadPromise5;
+      test('onmessage null stops delivery', omResult5.length === 2);
+      test('onmessage getter returns null after clear', readerOM5.onmessage === null);
+      workerOM5.terminate();
+
+      // handler errors don't break the loop
+      const workerOM6 = createWorker();
+      await waitForWorkerReady(workerOM6);
+      const sabOM6 = new SharedArrayBuffer(131072);
+      const readerOM6 = new SABPipe('r', sabOM6);
+      const omReadPromise6 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage error-recovery timeout')), 10000);
+        const collected = [];
+        let callCount = 0;
+        readerOM6.onmessage = (e) => {
+          callCount++;
+          if (callCount === 1) {
+            collected.push(e.data);
+            throw new Error('handler error on purpose');
+          }
+          collected.push(e.data);
+          if (collected.length >= 3) {
+            clearTimeout(timeout);
+            readerOM6.onmessage = null;
+            resolve(collected);
+          }
+        };
+      });
+      const omWorkerPromise6 = runWorkerTest(workerOM6, 'test_async_write_multiple', sabOM6, {
+        count: 3, testTimeout: 10000
+      });
+      const omResult6 = await omReadPromise6;
+      await omWorkerPromise6;
+      test('handler error: all 3 received', omResult6.length === 3);
+      test('handler error: order preserved', omResult6.every((m, i) => m.id === i));
+      workerOM6.terminate();
+
+      // disposal stops the loop
+      const sabOM7 = new SharedArrayBuffer(131072);
+      const readerOM7 = new SABPipe('r', sabOM7);
+      const writerOM7 = new SABPipe('w', sabOM7);
+      readerOM7.onmessage = () => {};
+      await new Promise(r => setTimeout(r, 50));
+      writerOM7.destroy();
+      await new Promise(r => setTimeout(r, 50));
+      const omLoopStopped = !readerOM7._messageLoopActive;
+      test('disposal stops onmessage loop', omLoopStopped === true);
+
+      // re-assignment swaps handler immediately
+      const workerOM8 = createWorker();
+      await waitForWorkerReady(workerOM8);
+      const sabOM8 = new SharedArrayBuffer(131072);
+      const readerOM8 = new SABPipe('r', sabOM8);
+      const omReadPromise8 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('onmessage reassign timeout')), 10000);
+        const handler1Msgs = [];
+        const handler2Msgs = [];
+        readerOM8.onmessage = (e) => {
+          handler1Msgs.push(e.data);
+          if (handler1Msgs.length >= 2) {
+            readerOM8.onmessage = (e2) => {
+              handler2Msgs.push(e2.data);
+              if (handler2Msgs.length >= 2) {
+                clearTimeout(timeout);
+                readerOM8.onmessage = null;
+                resolve({ handler1Msgs, handler2Msgs });
+              }
+            };
+          }
+        };
+      });
+      const omWorkerPromise8 = runWorkerTest(workerOM8, 'test_async_write_multiple', sabOM8, {
+        count: 4, testTimeout: 10000
+      });
+      const omResult8 = await omReadPromise8;
+      await omWorkerPromise8;
+      test('re-assignment: handler1 got messages', omResult8.handler1Msgs.length === 2);
+      test('re-assignment: handler2 got messages', omResult8.handler2Msgs.length === 2);
+      test('re-assignment: all in order',
+        omResult8.handler1Msgs[0].id === 0 && omResult8.handler1Msgs[1].id === 1 &&
+        omResult8.handler2Msgs[0].id === 2 && omResult8.handler2Msgs[1].id === 3);
+      workerOM8.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Performance');
+      // ─────────────────────────────────────────────────────────────
+
+      const ITERATIONS = 1000;
+      const worker7 = createWorker();
+      await waitForWorkerReady(worker7);
+      const sab10 = new SharedArrayBuffer(131072);
+      const writer10 = new SABPipe('w', sab10);
+
+      const testData = [];
+      for (let i = 0; i < ITERATIONS; i++) {
+        testData.push({ id: i, payload: 'x'.repeat(500 + Math.floor(Math.random() * 500)) });
+      }
+      const totalBytes = testData.reduce((sum, d) => sum + JSON.stringify(d).length, 0);
+
+      const workerPromise10 = runWorkerTest(worker7, 'test_perf_read', sab10, { iterations: ITERATIONS, testTimeout: 60000 });
+      await new Promise(r => setTimeout(r, 50));
+
+      const perfStart = performance.now();
+      for (let i = 0; i < ITERATIONS; i++) {
+        await writer10.postMessage(testData[i]);
+      }
+      const perfEnd = performance.now();
+      const perfTime = perfEnd - perfStart;
+
+      const result10 = await workerPromise10;
+      const throughputMBps = (totalBytes / 1024 / 1024) / (perfTime / 1000);
+
+      const sabAvgLatency = (perfTime / ITERATIONS * 1000);
+
+      test('all messages received', result10.count === ITERATIONS);
+      perf(`SABPipe: ${ITERATIONS} msgs, ${(totalBytes/1024).toFixed(0)}KB`, `${perfTime.toFixed(1)}ms, ${throughputMBps.toFixed(2)} MB/s, avg ${sabAvgLatency.toFixed(1)}µs/msg`);
+      worker7.terminate();
+
+      // --- MessagePort Performance Comparison ---
+      const mpWorker = createWorker();
+      await waitForWorkerReady(mpWorker);
+
+      const messageChannel = new MessageChannel();
+
+      // Set up result handler
+      const mpResultPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          mpWorker.terminate();
+          reject(new Error('Timeout: MessagePort perf'));
+        }, 60000);
+        const handler = (e) => {
+          if (e.data.result !== undefined) {
+            clearTimeout(timeout);
+            mpWorker.removeEventListener('message', handler);
+            resolve(e.data.result);
+          }
+        };
+        mpWorker.addEventListener('message', handler);
+      });
+
+      // Send command with transferred port
+      mpWorker.postMessage(
+        { test: 'test_perf_messageport', options: { iterations: ITERATIONS }, port: messageChannel.port2 },
+        [messageChannel.port2]
+      );
+
+      // Run MessagePort round-trip test: send, wait for echo, repeat
+      const mpStart = performance.now();
+      let mpCount = 0;
+
+      await new Promise((resolve) => {
+        messageChannel.port1.onmessage = (e) => {
+          mpCount++;
+          if (mpCount < ITERATIONS) {
+            messageChannel.port1.postMessage(testData[mpCount]);
+          } else {
+            resolve();
+          }
+        };
+        // Send first message to kick off
+        messageChannel.port1.postMessage(testData[0]);
+      });
+
+      const mpEnd = performance.now();
+      const mpTime = mpEnd - mpStart;
+      const mpThroughput = (totalBytes / 1024 / 1024) / (mpTime / 1000);
+
+      await mpResultPromise;
+      mpWorker.terminate();
+      messageChannel.port1.close();
+
+      const mpAvgLatency = (mpTime / ITERATIONS * 1000);
+
+      test('MessagePort all messages echoed', mpCount === ITERATIONS);
+      perf(`MessagePort: ${ITERATIONS} msgs, ${(totalBytes/1024).toFixed(0)}KB`, `${mpTime.toFixed(1)}ms, ${mpThroughput.toFixed(2)} MB/s, avg ${mpAvgLatency.toFixed(1)}µs/msg`);
+
+      // Comparison
+      const ratio = perfTime / mpTime;
+      const faster = ratio < 1 ? 'SABPipe' : 'MessagePort';
+      const factor = ratio < 1 ? (1/ratio).toFixed(2) : ratio.toFixed(2);
+      perf('Comparison', `${faster} is ${factor}x faster (${sabAvgLatency.toFixed(1)}µs vs ${mpAvgLatency.toFixed(1)}µs per msg)`);
+
+      // ─────────────────────────────────────────────────────────────
+      group('Stress: High Volume (10,000 messages)');
+      // ─────────────────────────────────────────────────────────────
+
+      const STRESS_COUNT = 10000;
+      const workerStress1 = createWorker();
+      await waitForWorkerReady(workerStress1);
+      const sabStress1 = new SharedArrayBuffer(131072);
+      const writerStress1 = new SABPipe('w', sabStress1);
+
+      const stressPromise1 = runWorkerTest(workerStress1, 'test_stress_high_volume', sabStress1, {
+        count: STRESS_COUNT, testTimeout: 60000
+      });
+      await new Promise(r => setTimeout(r, 50));
+
+      const hvStart = performance.now();
+      for (let i = 0; i < STRESS_COUNT; i++) {
+        await writerStress1.postMessage({ id: i, v: i * 2 });
+      }
+      const hvTime = performance.now() - hvStart;
+
+      const stressResult1 = await stressPromise1;
+      test('high volume: all received', stressResult1.received === STRESS_COUNT);
+      test('high volume: order correct', stressResult1.orderOk === true);
+      test('high volume: data intact', stressResult1.dataOk === true);
+      perf(`high volume: ${STRESS_COUNT} msgs`, `${hvTime.toFixed(1)}ms`);
+      workerStress1.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Stress: Large Payloads');
+      // ─────────────────────────────────────────────────────────────
+
+      const LARGE_SIZE = 500000;
+      const workerStress2 = createWorker();
+      await waitForWorkerReady(workerStress2);
+      const sabStress2 = new SharedArrayBuffer(131072);
+      const writerStress2 = new SABPipe('w', sabStress2);
+
+      const stressPromise2 = runWorkerTest(workerStress2, 'test_stress_large_payload', sabStress2, {
+        testTimeout: 60000
+      });
+      await new Promise(r => setTimeout(r, 50));
+
+      const largePayload = [];
+      for (let i = 0; i < LARGE_SIZE; i++) largePayload.push(i % 256);
+
+      const lpStart = performance.now();
+      await writerStress2.postMessage(largePayload);
+      const lpTime = performance.now() - lpStart;
+
+      const stressResult2 = await stressPromise2;
+      test('large payload: received', stressResult2.received === true);
+      assertEqual('large payload: length correct', stressResult2.length, LARGE_SIZE);
+      test('large payload: data valid', stressResult2.valid === true);
+      perf(`large payload: ${(LARGE_SIZE/1024).toFixed(0)}KB`, `${lpTime.toFixed(1)}ms`);
+      workerStress2.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Stress: Rapid Create/Destroy');
+      // ─────────────────────────────────────────────────────────────
+
+      const LIFECYCLE_ROUNDS = 50;
+      let lifecycleOk = 0;
+
+      const lcStart = performance.now();
+      for (let i = 0; i < LIFECYCLE_ROUNDS; i++) {
+        const lcWorker = createWorker();
+        await waitForWorkerReady(lcWorker);
+        const lcSab = new SharedArrayBuffer(131072);
+        const lcWriter = new SABPipe('w', lcSab);
+
+        const lcPromise = runWorkerTest(lcWorker, 'test_stress_lifecycle_read', lcSab, { testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 20));
+        await lcWriter.postMessage({ round: i });
+        const lcResult = await lcPromise;
+        if (lcResult.received && lcResult.value?.round === i) lifecycleOk++;
+
+        lcWriter.destroy();
+        lcWorker.terminate();
+      }
+      const lcTime = performance.now() - lcStart;
+
+      test('lifecycle: all rounds ok', lifecycleOk === LIFECYCLE_ROUNDS);
+      perf(`lifecycle: ${LIFECYCLE_ROUNDS} create/write/destroy cycles`, `${lcTime.toFixed(1)}ms`);
+
+      // ─────────────────────────────────────────────────────────────
+      group('Stress: Mixed Sizes');
+      // ─────────────────────────────────────────────────────────────
+
+      const MIXED_COUNT = 100;
+      const workerStress4 = createWorker();
+      await waitForWorkerReady(workerStress4);
+      const sabStress4 = new SharedArrayBuffer(131072);
+      const writerStress4 = new SABPipe('w', sabStress4);
+
+      const stressPromise4 = runWorkerTest(workerStress4, 'test_stress_mixed_sizes', sabStress4, {
+        count: MIXED_COUNT, testTimeout: 60000
+      });
+      await new Promise(r => setTimeout(r, 50));
+
+      const sizes = [];
+      for (let i = 0; i < MIXED_COUNT; i++) {
+        let size;
+        if (i % 10 === 9) size = 50000;
+        else if (i % 3 === 0) size = 1000;
+        else size = 10;
+        sizes.push(size);
+      }
+
+      const msStart = performance.now();
+      for (let i = 0; i < MIXED_COUNT; i++) {
+        const payload = 'x'.repeat(sizes[i]);
+        await writerStress4.postMessage({ id: i, payload, expectedLen: sizes[i] });
+      }
+      const msTime = performance.now() - msStart;
+
+      const stressResult4 = await stressPromise4;
+      test('mixed sizes: all received', stressResult4.received === MIXED_COUNT);
+      test('mixed sizes: all valid', stressResult4.allValid === true);
+      perf(`mixed sizes: ${MIXED_COUNT} msgs (tiny/medium/huge)`, `${msTime.toFixed(1)}ms`);
+      workerStress4.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('Stress: Sustained Throughput');
+      // ─────────────────────────────────────────────────────────────
+
+      const SUSTAIN_DURATION_MS = 3000;
+      const workerStress5 = createWorker();
+      await waitForWorkerReady(workerStress5);
+      const sabStress5 = new SharedArrayBuffer(131072);
+      const writerStress5 = new SABPipe('w', sabStress5);
+
+      const stressPromise5 = runWorkerTest(workerStress5, 'test_stress_sustained', sabStress5, {
+        testTimeout: SUSTAIN_DURATION_MS + 5000
+      });
+      await new Promise(r => setTimeout(r, 50));
+
+      let sustainCount = 0;
+      const sustainStart = performance.now();
+      while (performance.now() - sustainStart < SUSTAIN_DURATION_MS) {
+        await writerStress5.postMessage({ id: sustainCount, data: 'x'.repeat(500) });
+        sustainCount++;
+      }
+
+      const stressResult5 = await stressPromise5;
+      const sustainTime = performance.now() - sustainStart;
+
+      test('sustained: order correct', stressResult5.orderOk === true);
+      test('sustained: reader got all', stressResult5.count === sustainCount);
+      perf(`sustained: ${stressResult5.count} msgs in ${(sustainTime/1000).toFixed(1)}s`, `${(stressResult5.count / (sustainTime/1000)).toFixed(0)} msgs/s, ${(stressResult5.totalBytes / 1024 / 1024 / (sustainTime/1000)).toFixed(2)} MB/s`);
+      workerStress5.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('asyncRead Performance');
+      // ─────────────────────────────────────────────────────────────
+
+      const AR_ITERATIONS = 1000;
+      const workerARPerf = createWorker();
+      await waitForWorkerReady(workerARPerf);
+      const sabARPerf = new SharedArrayBuffer(131072);
+      const readerARPerf = new SABPipe('r', sabARPerf);
+
+      const arTestData = [];
+      for (let i = 0; i < AR_ITERATIONS; i++) {
+        arTestData.push({ id: i, payload: 'x'.repeat(500 + Math.floor(Math.random() * 500)) });
+      }
+      const arTotalBytes = arTestData.reduce((sum, d) => sum + JSON.stringify(d).length, 0);
+
+      const arReadStart = readerARPerf.asyncRead(5000);
+      const arPerfPromise = runWorkerTest(workerARPerf, 'test_async_write_perf', sabARPerf, {
+        iterations: AR_ITERATIONS, testData: arTestData, testTimeout: 60000
+      });
+
+      const arPerfStart = performance.now();
+      let arPerfCount = 0;
+      const firstMsg = await arReadStart;
+      if (firstMsg && firstMsg.id === 0) arPerfCount++;
+      for (let i = 1; i < AR_ITERATIONS; i++) {
+        const msg = await readerARPerf.asyncRead(5000);
+        if (msg && msg.id === i) arPerfCount++;
+      }
+      const arPerfTime = performance.now() - arPerfStart;
+
+      await arPerfPromise;
+      const arThroughput = (arTotalBytes / 1024 / 1024) / (arPerfTime / 1000);
+      const arAvgLatency = (arPerfTime / AR_ITERATIONS * 1000);
+
+      test('asyncRead perf: all received', arPerfCount === AR_ITERATIONS);
+      perf(`asyncRead: ${AR_ITERATIONS} msgs, ${(arTotalBytes/1024).toFixed(0)}KB`, `${arPerfTime.toFixed(1)}ms, ${arThroughput.toFixed(2)} MB/s, avg ${arAvgLatency.toFixed(1)}µs/msg`);
+      workerARPerf.terminate();
+
+      // --- Native postMessage Performance Comparison ---
+      const arNMpWorker = createWorker();
+      await waitForWorkerReady(arNMpWorker);
+      const arNChannel = new MessageChannel();
+
+      const arNResultPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          arNMpWorker.terminate();
+          reject(new Error('Timeout: native postMessage perf'));
+        }, 60000);
+        const handler = (e) => {
+          if (e.data.result !== undefined) {
+            clearTimeout(timeout);
+            arNMpWorker.removeEventListener('message', handler);
+            resolve(e.data.result);
+          }
+        };
+        arNMpWorker.addEventListener('message', handler);
+      });
+
+      let arNCount = 0;
+      const arNRecvPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout: native recv')), 60000);
+        arNChannel.port1.onmessage = () => {
+          arNCount++;
+          if (arNCount >= AR_ITERATIONS) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        };
+      });
+
+      const arNStart = performance.now();
+      arNMpWorker.postMessage(
+        { test: 'test_perf_native_write', options: { testData: arTestData, iterations: AR_ITERATIONS }, port: arNChannel.port2 },
+        [arNChannel.port2]
+      );
+      await arNRecvPromise;
+      const arNTime = performance.now() - arNStart;
+
+      await arNResultPromise;
+      arNMpWorker.terminate();
+      arNChannel.port1.close();
+
+      const arNThroughput = (arTotalBytes / 1024 / 1024) / (arNTime / 1000);
+      const arNAvgLatency = (arNTime / AR_ITERATIONS * 1000);
+
+      test('native postMessage all received', arNCount === AR_ITERATIONS);
+      perf(`Native postMessage: ${AR_ITERATIONS} msgs, ${(arTotalBytes/1024).toFixed(0)}KB`, `${arNTime.toFixed(1)}ms, ${arNThroughput.toFixed(2)} MB/s, avg ${arNAvgLatency.toFixed(1)}µs/msg`);
+
+      const arRatio = arPerfTime / arNTime;
+      const arFaster = arRatio < 1 ? 'asyncRead' : 'postMessage';
+      const arFactor = arRatio < 1 ? (1/arRatio).toFixed(2) : arRatio.toFixed(2);
+      perf('Comparison', `${arFaster} is ${arFactor}x faster (${arAvgLatency.toFixed(1)}µs vs ${arNAvgLatency.toFixed(1)}µs per msg)`);
+
+      // ─────────────────────────────────────────────────────────────
+      group('asyncRead Stress: High Volume (10,000 messages)');
+      // ─────────────────────────────────────────────────────────────
+
+      const AR_STRESS_COUNT = 10000;
+      const workerARStress1 = createWorker();
+      await waitForWorkerReady(workerARStress1);
+      const sabARStress1 = new SharedArrayBuffer(131072);
+      const readerARStress1 = new SABPipe('r', sabARStress1);
+
+      const arReadHv = readerARStress1.asyncRead(5000);
+      const arStressPromise1 = runWorkerTest(workerARStress1, 'test_async_write_high_volume', sabARStress1, {
+        count: AR_STRESS_COUNT, testTimeout: 60000
+      });
+
+      const arHvStart = performance.now();
+      let arHvReceived = 0;
+      let arHvOrderOk = true;
+      let arHvDataOk = true;
+      const firstHv = await arReadHv;
+      if (!firstHv || firstHv.id !== 0) arHvOrderOk = false;
+      if (!firstHv || firstHv.v !== 0) arHvDataOk = false;
+      arHvReceived++;
+      for (let i = 1; i < AR_STRESS_COUNT; i++) {
+        const msg = await readerARStress1.asyncRead(5000);
+        if (!msg || msg.id !== i) arHvOrderOk = false;
+        if (!msg || msg.v !== i * 2) arHvDataOk = false;
+        arHvReceived++;
+      }
+      const arHvTime = performance.now() - arHvStart;
+
+      await arStressPromise1;
+      test('asyncRead high volume: all received', arHvReceived === AR_STRESS_COUNT);
+      test('asyncRead high volume: order correct', arHvOrderOk === true);
+      test('asyncRead high volume: data intact', arHvDataOk === true);
+      perf(`asyncRead high volume: ${AR_STRESS_COUNT} msgs`, `${arHvTime.toFixed(1)}ms`);
+      workerARStress1.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('asyncRead Stress: Large Payloads');
+      // ─────────────────────────────────────────────────────────────
+
+      const AR_LARGE_SIZE = 500000;
+      const workerARStress2 = createWorker();
+      await waitForWorkerReady(workerARStress2);
+      const sabARStress2 = new SharedArrayBuffer(131072);
+      const readerARStress2 = new SABPipe('r', sabARStress2);
+
+      const arReadLp = readerARStress2.asyncRead(60000);
+      const arStressPromise2 = runWorkerTest(workerARStress2, 'test_async_write_large_payload', sabARStress2, {
+        size: AR_LARGE_SIZE, testTimeout: 60000
+      });
+
+      const arLpStart = performance.now();
+      const arLpMsg = await arReadLp;
+      const arLpTime = performance.now() - arLpStart;
+
+      await arStressPromise2;
+      let arLpValid = true;
+      if (!arLpMsg || !Array.isArray(arLpMsg)) {
+        arLpValid = false;
+      } else {
+        for (let i = 0; i < arLpMsg.length; i++) {
+          if (arLpMsg[i] !== i % 256) { arLpValid = false; break; }
+        }
+      }
+      test('asyncRead large payload: received', arLpMsg !== null);
+      assertEqual('asyncRead large payload: length', arLpMsg?.length, AR_LARGE_SIZE);
+      test('asyncRead large payload: valid', arLpValid === true);
+      perf(`asyncRead large payload: ${(AR_LARGE_SIZE/1024).toFixed(0)}KB`, `${arLpTime.toFixed(1)}ms`);
+      workerARStress2.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('asyncRead Stress: Mixed Sizes');
+      // ─────────────────────────────────────────────────────────────
+
+      const AR_MIXED_COUNT = 100;
+      const arSizes = [];
+      for (let i = 0; i < AR_MIXED_COUNT; i++) {
+        if (i % 10 === 9) arSizes.push(50000);
+        else if (i % 3 === 0) arSizes.push(1000);
+        else arSizes.push(10);
+      }
+
+      const workerARStress4 = createWorker();
+      await waitForWorkerReady(workerARStress4);
+      const sabARStress4 = new SharedArrayBuffer(131072);
+      const readerARStress4 = new SABPipe('r', sabARStress4);
+
+      const arReadMs = readerARStress4.asyncRead(30000);
+      const arStressPromise4 = runWorkerTest(workerARStress4, 'test_async_write_mixed_sizes', sabARStress4, {
+        sizes: arSizes, testTimeout: 60000
+      });
+
+      const arMsStart = performance.now();
+      let arMsReceived = 0;
+      let arMsAllValid = true;
+      const firstMs = await arReadMs;
+      if (firstMs === null) { arMsAllValid = false; }
+      else {
+        if (firstMs.id !== 0) arMsAllValid = false;
+        if (firstMs.payload.length !== firstMs.expectedLen) arMsAllValid = false;
+        arMsReceived++;
+      }
+      for (let i = 1; i < AR_MIXED_COUNT; i++) {
+        const msg = await readerARStress4.asyncRead(30000);
+        if (msg === null) { arMsAllValid = false; break; }
+        if (msg.id !== i) arMsAllValid = false;
+        if (msg.payload.length !== msg.expectedLen) arMsAllValid = false;
+        arMsReceived++;
+      }
+      const arMsTime = performance.now() - arMsStart;
+
+      await arStressPromise4;
+      test('asyncRead mixed sizes: all received', arMsReceived === AR_MIXED_COUNT);
+      test('asyncRead mixed sizes: all valid', arMsAllValid === true);
+      perf(`asyncRead mixed sizes: ${AR_MIXED_COUNT} msgs`, `${arMsTime.toFixed(1)}ms`);
+      workerARStress4.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('asyncRead Stress: Sustained Throughput');
+      // ─────────────────────────────────────────────────────────────
+
+      const AR_SUSTAIN_MS = 3000;
+      const workerARStress5 = createWorker();
+      await waitForWorkerReady(workerARStress5);
+      const sabARStress5 = new SharedArrayBuffer(131072);
+      const readerARStress5 = new SABPipe('r', sabARStress5);
+
+      const arReadSustain = readerARStress5.asyncRead(5000);
+      const arStressPromise5 = runWorkerTest(workerARStress5, 'test_async_write_sustained', sabARStress5, {
+        duration: AR_SUSTAIN_MS, testTimeout: AR_SUSTAIN_MS + 10000
+      });
+
+      let arSustainCount = 0;
+      let arSustainBytes = 0;
+      let arSustainLastId = -1;
+      let arSustainOrderOk = true;
+      const arSustainStart = performance.now();
+
+      const firstSustain = await arReadSustain;
+      if (firstSustain !== null) {
+        if (firstSustain.id !== 0) arSustainOrderOk = false;
+        arSustainLastId = firstSustain.id;
+        arSustainBytes += JSON.stringify(firstSustain).length;
+        arSustainCount++;
+      }
+      while (true) {
+        const msg = await readerARStress5.asyncRead(200);
+        if (msg === null) break;
+        if (msg.id !== arSustainLastId + 1) arSustainOrderOk = false;
+        arSustainLastId = msg.id;
+        arSustainBytes += JSON.stringify(msg).length;
+        arSustainCount++;
+      }
+      const arSustainTime = performance.now() - arSustainStart;
+
+      const arSustainResult = await arStressPromise5;
+      test('asyncRead sustained: order correct', arSustainOrderOk === true);
+      test('asyncRead sustained: reader got all', arSustainCount === arSustainResult.written);
+      perf(`asyncRead sustained: ${arSustainCount} msgs in ${(arSustainTime/1000).toFixed(1)}s`, `${(arSustainCount / (arSustainTime/1000)).toFixed(0)} msgs/s, ${(arSustainBytes / 1024 / 1024 / (arSustainTime/1000)).toFixed(2)} MB/s`);
+      workerARStress5.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('SABMessagePort: Construction');
+      // ─────────────────────────────────────────────────────────────
+
+      // Default side and size
+      const bidi1 = new SABMessagePort();
+      test('bidi: default creates 256KB SAB', bidi1.buffer.byteLength === 256 * 1024);
+
+      // Custom size
+      const bidi2 = new SABMessagePort('a', 128);
+      test('bidi: custom size 128KB', bidi2.buffer.byteLength === 128 * 1024);
+
+      // Existing SAB
+      const bidiSab = new SharedArrayBuffer(64 * 1024);
+      const bidi2b = new SABMessagePort('a', bidiSab);
+      test('bidi: accepts existing SAB', bidi2b.buffer === bidiSab);
+
+      // Invalid side
+      let bidiSideError = null;
+      try { new SABMessagePort('x'); } catch (e) { bidiSideError = e; }
+      test('bidi: invalid side throws', bidiSideError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('SABMessagePort: postInit / from');
+      // ─────────────────────────────────────────────────────────────
+
+      // postInit returns args array when target is null
+      const bidi3 = new SABMessagePort();
+      const initArgs = bidi3.postInit(null, { channel: 'test' });
+      test('bidi: postInit returns array', Array.isArray(initArgs));
+      test('bidi: postInit msg has type', initArgs[0].type === 'SABMessagePort');
+      test('bidi: postInit msg has buffer', initArgs[0].buffer === bidi3.buffer);
+      test('bidi: postInit msg has extraProps', initArgs[0].channel === 'test');
+      test('bidi: postInit transfer list', Array.isArray(initArgs[1]) && initArgs[1][0] === bidi3.buffer);
+
+      // from() factory
+      const bidi4a = new SABMessagePort();
+      const bidi4Msg = bidi4a.postInit(null)[0];
+      const bidi4b = SABMessagePort.from(bidi4Msg);
+      test('bidi: from() creates instance', bidi4b instanceof SABMessagePort);
+      test('bidi: from() shares buffer', bidi4b.buffer === bidi4a.buffer);
+
+      // from() with invalid msg
+      let fromError = null;
+      try { SABMessagePort.from({ type: 'wrong' }); } catch (e) { fromError = e; }
+      test('bidi: from() rejects invalid', fromError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('SABMessagePort: Bidirectional Messaging');
+      // ─────────────────────────────────────────────────────────────
+
+      // Main writes, worker reads and echoes back
+      const workerBidi1 = createWorker();
+      await waitForWorkerReady(workerBidi1);
+      const sabBidi1 = new SharedArrayBuffer(256 * 1024);
+      const bidiMain1 = new SABMessagePort('a', sabBidi1);
+
+      const bidiReadPromise1 = bidiMain1.asyncRead(5000);
+      const bidiWorkerPromise1 = runWorkerTest(workerBidi1, 'test_bidi_echo', sabBidi1, { testTimeout: 10000 });
+      await new Promise(r => setTimeout(r, 50));
+      await bidiMain1.postMessage({ greeting: 'hello-bidi', num: 42 });
+      const bidiReply1 = await bidiReadPromise1;
+      await bidiWorkerPromise1;
+      test('bidi echo: received reply', bidiReply1 !== null);
+      assertEqual('bidi echo: content', bidiReply1?.echo?.greeting, 'hello-bidi');
+      assertEqual('bidi echo: worker tag', bidiReply1?.from, 'worker');
+      workerBidi1.terminate();
+
+      // Worker writes N, main reads and echoes back, worker reads echoes
+      const workerBidi2 = createWorker();
+      await waitForWorkerReady(workerBidi2);
+      const sabBidi2 = new SharedArrayBuffer(256 * 1024);
+      const bidiMain2 = new SABMessagePort('a', sabBidi2);
+
+      const bidiReadStart2 = bidiMain2.asyncRead(5000);
+      const bidiWorkerPromise2 = runWorkerTest(workerBidi2, 'test_bidi_write_read', sabBidi2, { count: 5, testTimeout: 10000 });
+
+      const bidiMsgs2 = [await bidiReadStart2];
+      bidiMain2.postMessage({ echoId: bidiMsgs2[0].id }); // no await
+      for (let i = 1; i < 5; i++) {
+        const msg = await bidiMain2.asyncRead(5000);
+        bidiMsgs2.push(msg);
+        bidiMain2.postMessage({ echoId: msg.id }); // no await
+      }
+      const bidiResult2 = await bidiWorkerPromise2;
+      test('bidi write-read: main received all', bidiMsgs2.length === 5);
+      test('bidi write-read: main order correct', bidiMsgs2.every((m, i) => m.id === i));
+      test('bidi write-read: worker echoes ok', bidiResult2.allOk === true);
+      workerBidi2.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('SABMessagePort: onmessage');
+      // ─────────────────────────────────────────────────────────────
+
+      const workerBidi3 = createWorker();
+      await waitForWorkerReady(workerBidi3);
+      const sabBidi3 = new SharedArrayBuffer(256 * 1024);
+      const bidiMain3 = new SABMessagePort('a', sabBidi3);
+
+      const bidiEchoPromise3 = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('bidi onmessage timeout')), 10000);
+        const collected = [];
+        bidiMain3.onmessage = (e) => {
+          collected.push(e.data);
+          if (collected.length >= 3) {
+            clearTimeout(timeout);
+            bidiMain3.onmessage = null;
+            resolve(collected);
+          }
+        };
+      });
+      const bidiWorkerPromise3 = runWorkerTest(workerBidi3, 'test_bidi_onmessage', sabBidi3, { count: 3, testTimeout: 10000 });
+      await new Promise(r => setTimeout(r, 50));
+      for (let i = 0; i < 3; i++) {
+        bidiMain3.postMessage({ id: i, data: `bidi-${i}` });
+      }
+      const bidiEchoes3 = await bidiEchoPromise3;
+      const bidiResult3 = await bidiWorkerPromise3;
+      test('bidi onmessage: received all echoes', bidiEchoes3.length === 3);
+      test('bidi onmessage: echoes correct', bidiEchoes3.every((m, i) => m.echo === i));
+      test('bidi onmessage: worker received all', bidiResult3.allOk === true);
+      workerBidi3.terminate();
+
+      // ─────────────────────────────────────────────────────────────
+      group('SABMessagePort: close');
+      // ─────────────────────────────────────────────────────────────
+
+      const bidiClose = new SABMessagePort();
+      bidiClose.close();
+      let bidiWriteAfterClose = null;
+      try { await bidiClose.postMessage({ test: 1 }); } catch (e) { bidiWriteAfterClose = e; }
+      test('bidi close: postMessage throws', bidiWriteAfterClose !== null);
+
+      let bidiReadAfterClose = null;
+      try { await bidiClose.asyncRead(0); } catch (e) { bidiReadAfterClose = e; }
+      test('bidi close: asyncRead throws', bidiReadAfterClose !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      summary();
+    }
+
+    // Run tests
+    runTests().catch(err => {
+      log(`<div class="fail">Test runner error: ${err.message}</div>`);
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
