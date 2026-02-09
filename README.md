@@ -437,4 +437,4 @@ Blocking reads are faster because `Atomics.wait` wakes with lower latency than t
 
 ## License
 
-BSD
+[BSD-3-Clause](LICENSE)

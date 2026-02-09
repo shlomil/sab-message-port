@@ -11,9 +11,17 @@
     "./src": "./src/SABMessagePort.js"
   },
   "main": "./dist/SABMessagePort.min.js",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "esbuild src/SABMessagePort.js --bundle --format=esm --minify --outfile=dist/SABMessagePort.min.js",
-    "test": "node test/test.mjs"
+    "test": "node test/test.mjs",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=16.0.0"
@@ -24,9 +32,22 @@
     "worker",
     "ipc",
     "messageport",
-    "zero-copy"
+    "zero-copy",
+    "blocking",
+    "web-worker",
+    "worker-threads",
+    "shared-memory"
   ],
+  "author": "Shlomi Loubaton",
   "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shlomil/sab-message-port.git"
+  },
+  "homepage": "https://github.com/shlomil/sab-message-port#readme",
+  "bugs": {
+    "url": "https://github.com/shlomil/sab-message-port/issues"
+  },
   "devDependencies": {
     "esbuild": "^0.27.3"
   }
