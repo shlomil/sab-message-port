@@ -172,14 +172,14 @@ Async read using `Atomics.waitAsync`. **Safe on the main thread.** Waits for a m
 **Return value depends on `maxMessages`:**
 
 - **`maxMessages = 1`** (default): Returns a single message, or `null` if timeout expired with no data.
-- **`maxMessages > 1`**: Returns an **array** of messages ordered **oldest-first** (FIFO), up to `maxMessages` items. Returns an **empty array** `[]` if timeout expired with no data.
+- **`maxMessages > 1`**: Returns an **array** of messages ordered **newest-first, oldest-last**, up to `maxMessages` items. Returns an **empty array** `[]` if timeout expired with no data. You can `pop()` from the returned array to process messages in send order (FIFO).
 
 If messages are already queued internally from a previous batch, they are returned immediately without waiting.
 
 ```javascript
 const msg = await port.asyncRead();          // wait forever, returns single message
 const msg = await port.asyncRead(1000);      // wait up to 1s, returns message or null
-const msgs = await port.asyncRead(1000, 5);  // up to 5 messages, returns array (oldest first)
+const msgs = await port.asyncRead(1000, 5);  // up to 5 messages, array (newest first, pop for FIFO)
 const msgs = await port.asyncRead(0, 10);    // non-blocking, returns whatever is available now
 ```
 
@@ -198,7 +198,7 @@ Synchronous read using `Atomics.wait`. **Worker threads only** — calling this 
 **Return value depends on `maxMessages`:**
 
 - **`maxMessages = 1`** (default): Returns a single message, or `null` if no data is available (timeout or non-blocking).
-- **`maxMessages > 1`**: Returns an **array** of messages ordered **oldest-first** (FIFO), up to `maxMessages` items. Returns an **empty array** `[]` if no data is available.
+- **`maxMessages > 1`**: Returns an **array** of messages ordered **newest-first, oldest-last**, up to `maxMessages` items. Returns an **empty array** `[]` if no data is available. You can `pop()` from the returned array to process messages in send order (FIFO).
 
 If messages are already queued internally from a previous batch, they are returned immediately without blocking.
 
@@ -208,7 +208,7 @@ If messages are already queued internally from a previous batch, they are return
 const msg = port.read();                    // block forever until message
 const msg = port.read(500);                 // block up to 500ms, null on timeout
 const msg = port.read(0, false);            // non-blocking, returns null if empty
-const msgs = port.read(1000, true, 5);      // block up to 1s, return up to 5 messages (oldest first)
+const msgs = port.read(1000, true, 5);      // block up to 1s, up to 5 msgs (newest first, pop for FIFO)
 ```
 
 Throws if the port has been closed, or if `onmessage` is active.
@@ -224,11 +224,11 @@ Non-blocking read. Equivalent to `port.read(0, false, maxMessages)`. Returns imm
 **Return value depends on `maxMessages`:**
 
 - **`maxMessages = 1`** (default): Returns a single message, or `null`.
-- **`maxMessages > 1`**: Returns an **array** (oldest-first), or an **empty array** `[]`.
+- **`maxMessages > 1`**: Returns an **array** (newest-first, oldest-last), or an **empty array** `[]`. `pop()` to process in FIFO order.
 
 ```javascript
 const msg = port.tryRead();       // single message or null
-const msgs = port.tryRead(10);    // up to 10 messages (array, oldest first) or []
+const msgs = port.tryRead(10);    // up to 10 messages (array, newest first) or []
 ```
 
 ### `port.close()`
@@ -281,7 +281,7 @@ writer.postMessage({ hello: 'world' });
 All read methods share the same return-value convention:
 
 - **`maxMessages = 1`** (default): returns a single message or `null`.
-- **`maxMessages > 1`**: returns an **array** of messages ordered **oldest-first** (FIFO), or an **empty array** `[]` if no data.
+- **`maxMessages > 1`**: returns an **array** of messages ordered **newest-first, oldest-last**, or an **empty array** `[]` if no data. `pop()` to process in FIFO order.
 
 #### `reader.read(timeout?, blocking?, maxMessages?)`
 
@@ -341,8 +341,11 @@ const msg0 = reader.read();   // { id: 0 } — waited for data
 const msg1 = reader.read();   // { id: 1 } — returned immediately from queue
 const msg2 = reader.read();   // { id: 2 } — returned immediately from queue
 
-// Or get all at once
-const msgs = reader.read(Infinity, true, 10); // [{ id: 0 }, { id: 1 }, { id: 2 }]
+// Or get all at once (newest first — pop() for FIFO)
+const msgs = reader.read(Infinity, true, 10); // [{ id: 2 }, { id: 1 }, { id: 0 }]
+msgs.pop(); // { id: 0 } — oldest
+msgs.pop(); // { id: 1 }
+msgs.pop(); // { id: 2 } — newest
 ```
 
 ## Large Messages & Chunking
