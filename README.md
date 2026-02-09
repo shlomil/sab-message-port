@@ -52,6 +52,60 @@ self.onmessage = (e) => {
 };
 ```
 
+## Example: Blocking Reads with Interrupt
+
+With native `postMessage`, a worker can only receive messages by returning to the event loop. If the worker is stuck in a long synchronous loop, incoming messages pile up undelivered. `sab-message-port` solves this — `port.read()` blocks in-place via `Atomics.wait`, and `port.tryRead()` checks for signals mid-computation, all without yielding to the event loop.
+
+**main.js**
+
+```javascript
+import { SABMessagePort } from 'sab-message-port';
+
+const worker = new Worker('./worker.js', { type: 'module' });
+const port = new SABMessagePort();
+port.postInit(worker);
+
+port.onmessage = ({ data }) => console.log(data);
+
+// Start a long task
+port.postMessage({ cmd: 'run', task: 'A', iterations: 5_000_000 });
+
+// After 200ms, abort and start a different task
+setTimeout(() => {
+  port.postMessage({ cmd: 'abort' });
+  port.postMessage({ cmd: 'run', task: 'B', iterations: 2_000_000 });
+}, 200);
+```
+
+**worker.js** — entirely synchronous, never yields to the event loop
+
+```javascript
+import { SABMessagePort } from 'sab-message-port';
+
+self.onmessage = (e) => {
+  if (e.data.type !== 'SABMessagePort') return;
+  const port = SABMessagePort.from(e.data);
+
+  while (true) {
+    const task = port.read();            // block until a task arrives
+    if (task.cmd !== 'run') continue;
+
+    for (let i = 0; i < task.iterations; i++) {
+      /* ... heavy work ... */
+
+      if (i % 500_000 === 0) {
+        port.postMessage({ task: task.task, progress: `${(i / task.iterations * 100) | 0}%` });
+
+        if (port.tryRead()?.cmd === 'abort') {   // non-blocking check
+          port.postMessage({ task: task.task, aborted: true });
+          break;                                  // → back to port.read()
+        }
+      }
+    }
+  }
+};
+```
+
 ---
 
 ## SABMessagePort
@@ -60,7 +114,7 @@ Bidirectional channel over a single `SharedArrayBuffer`. Both sides can read and
 
 All messages must be **JSON-serializable** (they go through `JSON.stringify`/`JSON.parse` internally). Message ordering is **FIFO** — messages are always delivered in the order they were sent.
 
-### `new SABMessagePort(side?, sizeKB?)`
+### `new SABMessagePort(side = 'a', sizeKB = 256)`
 
 Creates a new bidirectional port.
 
@@ -96,7 +150,7 @@ self.onmessage = (e) => {
 };
 ```
 
-### `port.postInit(target?, extraProps?)`
+### `port.postInit(target = null, extraProps = {})`
 
 Sends the shared buffer to the other side via `postMessage`, or returns the arguments for manual sending.
 
@@ -160,7 +214,7 @@ port.onmessage = null;
 
 **Re-assignment:** Assigning a new handler function replaces the current one immediately within the same loop — no gap in delivery and no duplicate loops.
 
-### `await port.asyncRead(timeout?, maxMessages?)` → message | null | Array
+### `await port.asyncRead(timeout = Infinity, maxMessages = 1)` → message | null | Array
 
 Async read using `Atomics.waitAsync`. **Safe on the main thread.** Waits for a message or until timeout expires.
 
@@ -185,7 +239,7 @@ const msgs = await port.asyncRead(0, 10);    // non-blocking, returns whatever i
 
 Throws if the port has been closed, or if `onmessage` is active.
 
-### `port.read(timeout?, blocking?, maxMessages?)` → message | null | Array
+### `port.read(timeout = Infinity, blocking = true, maxMessages = 1)` → message | null | Array
 
 Synchronous read using `Atomics.wait`. **Worker threads only** — calling this on the main thread throws (`Atomics.wait` is not allowed on the main thread).
 
@@ -213,7 +267,7 @@ const msgs = port.read(1000, true, 5);      // block up to 1s, up to 5 msgs (new
 
 Throws if the port has been closed, or if `onmessage` is active.
 
-### `port.tryRead(maxMessages?)` → message | null | Array
+### `port.tryRead(maxMessages = 1)` → message | null | Array
 
 Non-blocking read. Equivalent to `port.read(0, false, maxMessages)`. Returns immediately with available data.
 
@@ -247,12 +301,12 @@ Unidirectional channel — one end writes, the other reads. Used internally by `
 
 All messages must be **JSON-serializable**. Message ordering is **FIFO**.
 
-### `new SABPipe(role, sabOrSize?, byteOffset?, sectionSize?)`
+### `new SABPipe(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null)`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `role` | (required) | `'w'` (writer) or `'r'` (reader). Throws if invalid. |
-| `sabOrSize` | `131072` | Byte size for a new buffer (default 128 KB), or an existing `SharedArrayBuffer`. |
+| `sabOrSize` | `131072` | Byte size for a new buffer (128 KB), or an existing `SharedArrayBuffer`. |
 | `byteOffset` | `0` | Starting byte offset in the SAB. |
 | `sectionSize` | `null` | Section size in bytes. Defaults to the remaining SAB from `byteOffset`. |
 
@@ -283,7 +337,7 @@ All read methods share the same return-value convention:
 - **`maxMessages = 1`** (default): returns a single message or `null`.
 - **`maxMessages > 1`**: returns an **array** of messages ordered **newest-first, oldest-last**, or an **empty array** `[]` if no data. `pop()` to process in FIFO order.
 
-#### `reader.read(timeout?, blocking?, maxMessages?)`
+#### `reader.read(timeout = Infinity, blocking = true, maxMessages = 1)`
 
 Synchronous read. **Worker threads only** (uses `Atomics.wait`).
 
@@ -295,7 +349,7 @@ Synchronous read. **Worker threads only** (uses `Atomics.wait`).
 
 Timeout only applies to the initial wait. Multipart messages (large payloads that span multiple chunks) always wait for all parts once the first part arrives.
 
-#### `await reader.asyncRead(timeout?, maxMessages?)`
+#### `await reader.asyncRead(timeout = Infinity, maxMessages = 1)`
 
 Async read using `Atomics.waitAsync`. **Safe on the main thread.**
 
@@ -304,7 +358,7 @@ Async read using `Atomics.waitAsync`. **Safe on the main thread.**
 | `timeout` | `Infinity` | Max wait time in ms. |
 | `maxMessages` | `1` | Max messages to return. |
 
-#### `reader.tryRead(maxMessages?)`
+#### `reader.tryRead(maxMessages = 1)`
 
 Non-blocking read. Equivalent to `reader.read(0, false, maxMessages)`. Returns immediately.
 
