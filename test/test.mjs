@@ -5,7 +5,7 @@
 
 import { Worker, isMainThread, parentPort, workerData, MessageChannel } from 'worker_threads';
 import { fileURLToPath } from 'url';
-import { SABPipe, SABMessagePort } from '../src/SABMessagePort.js';
+import { SABPipe, SABMessagePort, MWChannel } from '../src/SABMessagePort.js';
 
 // Debug logging - set to true to enable
 const MYLOG_ON = false;
@@ -389,6 +389,30 @@ if (!isMainThread) {
         };
       });
       return { received: received.length, allOk: received.every((m, i) => m.id === i) };
+    },
+
+    // --- Round-trip comparison handlers ---
+
+    async test_roundtrip_sab_async(sab, options) {
+      const port = new SABMessagePort('b', sab);
+      const iterations = options.iterations || 1000;
+      parentPort.postMessage({ status: 'blocking' });
+      for (let i = 0; i < iterations; i++) {
+        const msg = await port.asyncRead(5000);
+        await port.postMessage(msg);
+      }
+      return { count: iterations };
+    },
+
+    async test_roundtrip_sab_blocking(sab, options) {
+      const port = new SABMessagePort('b', sab);
+      const iterations = options.iterations || 1000;
+      parentPort.postMessage({ status: 'blocking' });
+      for (let i = 0; i < iterations; i++) {
+        const msg = port.read();
+        await port.postMessage(msg);
+      }
+      return { count: iterations };
     }
   };
 
@@ -424,6 +448,146 @@ if (!isMainThread) {
           setTimeout(() => process.exit(0), 100);
         }
       });
+      return;
+    }
+
+    // --- MWChannel handlers ---
+
+    if (testName === 'test_mw_blocking_read') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        parentPort.postMessage({ status: 'blocking' });
+        const m = port.read(5000);
+        parentPort.postMessage({ result: { received: m, from: 'worker' } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_mw_blocking_multi') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        const count = options.count || 3;
+        const messages = [];
+        parentPort.postMessage({ status: 'blocking' });
+        for (let i = 0; i < count; i++) {
+          messages.push(port.read(5000));
+        }
+        parentPort.postMessage({ result: { messages } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_mw_worker_sends') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        const count = options.count || 3;
+        for (let i = 0; i < count; i++) {
+          port.postMessage({ id: i, data: `mw-msg-${i}` });
+        }
+        parentPort.postMessage({ result: { sent: count } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_mw_mode_switch') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        // Start in blocking mode (default), read one message
+        parentPort.postMessage({ status: 'blocking' });
+        const blockingMsg = port.read(5000);
+
+        // Switch to nonblocking
+        port.setMode('nonblocking');
+        const nbReceived = [];
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('mw onmessage timeout')), 5000);
+          port.onmessage = (e) => {
+            nbReceived.push(e.data);
+            if (nbReceived.length >= options.nbCount) {
+              clearTimeout(timeout);
+              port.onmessage = null;
+              resolve();
+            }
+          };
+          // Tell main we're ready for nonblocking messages
+          port.postMessage({ status: 'nb_ready' });
+        });
+
+        // Switch back to blocking, read one more
+        port.setMode('blocking');
+        port.postMessage({ status: 'blocking_again' });
+        const blockingMsg2 = port.read(5000);
+
+        parentPort.postMessage({ result: {
+          blockingMsg,
+          nbReceived,
+          blockingMsg2
+        }});
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_mw_drain') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        // Read one blocking message to sync with main
+        parentPort.postMessage({ status: 'blocking' });
+        const syncMsg = port.read(5000);
+
+        // Now main will send 3 more SAB messages and then signal us
+        // Wait for main to finish writing
+        parentPort.postMessage({ status: 'blocking' });
+        const goMsg = port.read(5000);
+
+        // Switch to nonblocking — should drain the remaining SAB messages
+        port.setMode('nonblocking');
+        const drained = [];
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('drain timeout')), 5000);
+          port.onmessage = (e) => {
+            drained.push(e.data);
+            if (drained.length >= options.drainCount) {
+              clearTimeout(timeout);
+              port.onmessage = null;
+              resolve();
+            }
+          };
+        });
+
+        parentPort.postMessage({ result: { syncMsg, goMsg, drained } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_roundtrip_mw_blocking') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        const iterations = options.iterations || 1000;
+        parentPort.postMessage({ status: 'blocking' });
+        for (let i = 0; i < iterations; i++) {
+          const m = port.read(5000);
+          port.postMessage(m);
+        }
+        parentPort.postMessage({ result: { count: iterations } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
       return;
     }
 
@@ -1599,6 +1763,410 @@ async function runTests() {
   let bidiReadAfterClose = null;
   try { await bidiClose.asyncRead(0); } catch (e) { bidiReadAfterClose = e; }
   test('bidi close: asyncRead throws', bidiReadAfterClose !== null);
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: Construction');
+  // ─────────────────────────────────────────────────────────────
+
+  const mw1 = new MWChannel('m');
+  test('mw: default creates 128KB SAB', mw1.buffer.byteLength === 128 * 1024);
+
+  const mw2 = new MWChannel('m', 256);
+  test('mw: custom size 256KB', mw2.buffer.byteLength === 256 * 1024);
+
+  let mwSideError = null;
+  try { new MWChannel('x'); } catch (e) { mwSideError = e; }
+  test('mw: invalid side throws', mwSideError !== null);
+
+  // Main side cannot call read/tryRead/asyncRead
+  let mwMainRead = null;
+  try { mw1.read(); } catch (e) { mwMainRead = e; }
+  test('mw: main cannot call read()', mwMainRead !== null);
+
+  let mwMainTryRead = null;
+  try { mw1.tryRead(); } catch (e) { mwMainTryRead = e; }
+  test('mw: main cannot call tryRead()', mwMainTryRead !== null);
+
+  let mwMainAsyncRead = null;
+  try { await mw1.asyncRead(); } catch (e) { mwMainAsyncRead = e; }
+  test('mw: main cannot call asyncRead()', mwMainAsyncRead !== null);
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: postInit / from');
+  // ─────────────────────────────────────────────────────────────
+
+  const mw3 = new MWChannel('m');
+  const mwInitArgs = mw3.postInit(null, { channel: 'test' });
+  test('mw: postInit returns array', Array.isArray(mwInitArgs));
+  test('mw: postInit msg has type', mwInitArgs[0].type === 'MWChannel');
+  test('mw: postInit msg has buffer', mwInitArgs[0].buffer === mw3.buffer);
+  test('mw: postInit msg has port', mwInitArgs[0].port !== undefined);
+  test('mw: postInit msg has extraProps', mwInitArgs[0].channel === 'test');
+  test('mw: postInit transfer has port', mwInitArgs[1].length === 1);
+
+  let mwFromError = null;
+  try { MWChannel.from({ type: 'wrong' }); } catch (e) { mwFromError = e; }
+  test('mw: from() rejects invalid', mwFromError !== null);
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: Blocking Read');
+  // ─────────────────────────────────────────────────────────────
+
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const worker = new Worker(__filename);
+
+    const { readyPromise, blockingPromise, resultPromise } = await (async () => {
+      let readyResolve, blockingResolve, resultResolve, resultReject;
+      const readyPromise = new Promise(r => { readyResolve = r; });
+      const blockingPromise = new Promise(r => { blockingResolve = r; });
+      const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+      const timeout = setTimeout(() => { worker.terminate(); resultReject(new Error('Timeout')); }, 5000);
+      worker.on('message', (msg) => {
+        if (msg.status === 'ready') readyResolve();
+        else if (msg.status === 'blocking') blockingResolve();
+        else if (msg.result !== undefined) { clearTimeout(timeout); resultResolve(msg.result); }
+        else if (msg.error) { clearTimeout(timeout); resultReject(new Error(msg.error)); }
+      });
+      return { readyPromise, blockingPromise, resultPromise };
+    })();
+
+    await readyPromise;
+    worker.postMessage({ test: 'test_mw_blocking_read', mwInit: initMsg, options: {} }, transfer);
+    await blockingPromise;
+    await mw.postMessage({ greeting: 'hello-mw', num: 99 });
+    const mwResult1 = await resultPromise;
+
+    test('mw blocking: received message', mwResult1.received !== null);
+    assertEqual('mw blocking: content', mwResult1.received?.greeting, 'hello-mw');
+    assertEqual('mw blocking: number', mwResult1.received?.num, 99);
+    test('mw blocking: from worker', mwResult1.from === 'worker');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: Multiple Blocking Reads');
+  // ─────────────────────────────────────────────────────────────
+
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const worker = new Worker(__filename);
+
+    let readyResolve, blockingResolve, resultResolve, resultReject;
+    const readyPromise = new Promise(r => { readyResolve = r; });
+    const blockingPromise = new Promise(r => { blockingResolve = r; });
+    const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+    const timeout = setTimeout(() => { worker.terminate(); resultReject(new Error('Timeout')); }, 5000);
+    worker.on('message', (msg) => {
+      if (msg.status === 'ready') readyResolve();
+      else if (msg.status === 'blocking') blockingResolve();
+      else if (msg.result !== undefined) { clearTimeout(timeout); resultResolve(msg.result); }
+      else if (msg.error) { clearTimeout(timeout); resultReject(new Error(msg.error)); }
+    });
+
+    await readyPromise;
+    worker.postMessage({ test: 'test_mw_blocking_multi', mwInit: initMsg, options: { count: 3 } }, transfer);
+    await blockingPromise;
+    for (let i = 0; i < 3; i++) {
+      await mw.postMessage({ id: i, data: `msg-${i}` });
+    }
+    const mwResult2 = await resultPromise;
+
+    test('mw multi: received all 3', mwResult2.messages.length === 3);
+    test('mw multi: correct order', mwResult2.messages.every((m, i) => m.id === i));
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: Worker Sends via MessagePort');
+  // ─────────────────────────────────────────────────────────────
+
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const worker = new Worker(__filename);
+
+    let readyResolve, resultResolve, resultReject;
+    const readyPromise = new Promise(r => { readyResolve = r; });
+    const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+    const timeout = setTimeout(() => { worker.terminate(); resultReject(new Error('Timeout')); }, 5000);
+    worker.on('message', (msg) => {
+      if (msg.status === 'ready') readyResolve();
+      else if (msg.result !== undefined) { clearTimeout(timeout); resultResolve(msg.result); }
+      else if (msg.error) { clearTimeout(timeout); resultReject(new Error(msg.error)); }
+    });
+
+    await readyPromise;
+    worker.postMessage({ test: 'test_mw_worker_sends', mwInit: initMsg, options: { count: 3 } }, transfer);
+
+    // Receive worker's messages via MWChannel onmessage (native MessagePort)
+    const received = [];
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('mw receive timeout')), 5000);
+      mw.onmessage = (e) => {
+        received.push(e.data);
+        if (received.length >= 3) {
+          clearTimeout(t);
+          mw.onmessage = null;
+          resolve();
+        }
+      };
+    });
+    await resultPromise;
+
+    test('mw worker sends: received all 3', received.length === 3);
+    test('mw worker sends: correct order', received.every((m, i) => m.id === i));
+    assertEqual('mw worker sends: content', received[0].data, 'mw-msg-0');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: Mode Switching');
+  // ─────────────────────────────────────────────────────────────
+
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const worker = new Worker(__filename);
+
+    let readyResolve, blockingResolve, resultResolve, resultReject;
+    const readyPromise = new Promise(r => { readyResolve = r; });
+    const blockingPromise = new Promise(r => { blockingResolve = r; });
+    const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+    const timeout = setTimeout(() => { worker.terminate(); resultReject(new Error('Timeout')); }, 10000);
+    worker.on('message', (msg) => {
+      if (msg.status === 'ready') readyResolve();
+      else if (msg.status === 'blocking') blockingResolve();
+      else if (msg.result !== undefined) { clearTimeout(timeout); resultResolve(msg.result); }
+      else if (msg.error) { clearTimeout(timeout); resultReject(new Error(msg.error)); }
+    });
+
+    await readyPromise;
+    worker.postMessage({ test: 'test_mw_mode_switch', mwInit: initMsg, options: { nbCount: 2 } }, transfer);
+    await blockingPromise;
+
+    // Phase 1: Send one message in blocking mode (SABPipe)
+    await mw.postMessage({ phase: 'blocking', id: 0 });
+
+    // Wait for worker to switch to nonblocking and signal ready
+    await new Promise((resolve) => {
+      mw.onmessage = (e) => {
+        if (e.data.status === 'nb_ready') {
+          mw.onmessage = null;
+          resolve();
+        }
+      };
+    });
+
+    // Phase 2: Switch main to nonblocking mode, send via native port
+    mw.setMode('nonblocking');
+    mw.postMessage({ phase: 'nonblocking', id: 1 });
+    mw.postMessage({ phase: 'nonblocking', id: 2 });
+
+    // Wait for worker to switch back to blocking and signal
+    await new Promise((resolve) => {
+      mw.onmessage = (e) => {
+        if (e.data.status === 'blocking_again') {
+          mw.onmessage = null;
+          resolve();
+        }
+      };
+    });
+
+    // Phase 3: Switch main back to blocking mode, send via SABPipe
+    mw.setMode('blocking');
+    await mw.postMessage({ phase: 'blocking2', id: 3 });
+
+    const mwResult4 = await resultPromise;
+
+    assertEqual('mw mode switch: blocking msg', mwResult4.blockingMsg?.phase, 'blocking');
+    test('mw mode switch: nb received 2', mwResult4.nbReceived.length === 2);
+    test('mw mode switch: nb correct', mwResult4.nbReceived.every((m, i) => m.id === i + 1));
+    assertEqual('mw mode switch: blocking2 msg', mwResult4.blockingMsg2?.phase, 'blocking2');
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('MWChannel: close');
+  // ─────────────────────────────────────────────────────────────
+
+  {
+    const mw = new MWChannel('m');
+    mw.close();
+    let mwWriteAfterClose = null;
+    try { await mw.postMessage({ test: 1 }); } catch (e) { mwWriteAfterClose = e; }
+    test('mw close: postMessage throws', mwWriteAfterClose !== null);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('Round-Trip Comparison');
+  // ─────────────────────────────────────────────────────────────
+
+  const RT_ITERATIONS = 1000;
+  const RT_MSG = { id: 0, data: 'x'.repeat(100) };
+  const rtMsgBytes = JSON.stringify(RT_MSG).length;
+  const rtTotalBytes = rtMsgBytes * 2 * RT_ITERATIONS; // both directions
+  const rtResults = [];
+
+  perf('Config', `${RT_ITERATIONS} round-trips, msg size: ${rtMsgBytes} bytes`);
+
+  // 1. Native MessagePort round-trip
+  {
+    const { port1, port2 } = new MessageChannel();
+    const w = new Worker(__filename);
+    await new Promise(resolve => {
+      const h = msg => { if (msg.status === 'ready') { w.removeListener('message', h); resolve(); } };
+      w.on('message', h);
+    });
+
+    const wResult = new Promise((resolve, reject) => {
+      const t = setTimeout(() => { w.terminate(); reject(new Error('Timeout')); }, 60000);
+      w.on('message', msg => { if (msg.result) { clearTimeout(t); resolve(msg.result); } });
+    });
+
+    w.postMessage(
+      { test: 'test_perf_messageport', options: { iterations: RT_ITERATIONS }, port: port2 },
+      [port2]
+    );
+
+    let rtNativeCount = 0;
+    const rtNativeStart = performance.now();
+
+    await new Promise(resolve => {
+      port1.on('message', () => {
+        rtNativeCount++;
+        if (rtNativeCount < RT_ITERATIONS) {
+          port1.postMessage(RT_MSG);
+        } else {
+          resolve();
+        }
+      });
+      port1.postMessage(RT_MSG);
+    });
+
+    const rtNativeTime = performance.now() - rtNativeStart;
+    await wResult;
+    w.terminate();
+    port1.close();
+
+    const rtNativeLatency = rtNativeTime / RT_ITERATIONS * 1000;
+    const rtNativeMBps = (rtTotalBytes / 1024 / 1024) / (rtNativeTime / 1000);
+    const rtNativeMps = RT_ITERATIONS / (rtNativeTime / 1000);
+    rtResults.push({ name: 'Native MessagePort', time: rtNativeTime, latency: rtNativeLatency, mbps: rtNativeMBps, mps: rtNativeMps });
+    test('RT native: all round-trips', rtNativeCount === RT_ITERATIONS);
+    perf(`1. Native MessagePort`, `${rtNativeTime.toFixed(1)}ms, ${rtNativeLatency.toFixed(1)}µs/rt, ${Math.round(rtNativeMps)} msg/s, ${rtNativeMBps.toFixed(2)} MB/s`);
+  }
+
+  // 2. SABMessagePort async round-trip
+  {
+    const rtSab = new SharedArrayBuffer(256 * 1024);
+    const rtPort = new SABMessagePort('a', rtSab);
+
+    const t2 = runWorkerTest('test_roundtrip_sab_async', rtSab, {
+      iterations: RT_ITERATIONS, waitForBlocking: true, testTimeout: 60000
+    });
+    await t2.ready();
+
+    let rtAsyncCount = 0;
+    const rtAsyncStart = performance.now();
+    for (let i = 0; i < RT_ITERATIONS; i++) {
+      await rtPort.postMessage(RT_MSG);
+      const reply = await rtPort.asyncRead(5000);
+      if (reply) rtAsyncCount++;
+    }
+    const rtAsyncTime = performance.now() - rtAsyncStart;
+    await t2.result;
+
+    const rtAsyncLatency = rtAsyncTime / RT_ITERATIONS * 1000;
+    const rtAsyncMBps = (rtTotalBytes / 1024 / 1024) / (rtAsyncTime / 1000);
+    const rtAsyncMps = RT_ITERATIONS / (rtAsyncTime / 1000);
+    rtResults.push({ name: 'SABMessagePort async', time: rtAsyncTime, latency: rtAsyncLatency, mbps: rtAsyncMBps, mps: rtAsyncMps });
+    test('RT SAB async: all round-trips', rtAsyncCount === RT_ITERATIONS);
+    perf(`2. SABMessagePort async`, `${rtAsyncTime.toFixed(1)}ms, ${rtAsyncLatency.toFixed(1)}µs/rt, ${Math.round(rtAsyncMps)} msg/s, ${rtAsyncMBps.toFixed(2)} MB/s`);
+  }
+
+  // 3. SABMessagePort blocking worker round-trip
+  {
+    const rtSab = new SharedArrayBuffer(256 * 1024);
+    const rtPort = new SABMessagePort('a', rtSab);
+
+    const t3 = runWorkerTest('test_roundtrip_sab_blocking', rtSab, {
+      iterations: RT_ITERATIONS, waitForBlocking: true, testTimeout: 60000
+    });
+    await t3.ready();
+
+    let rtBlockCount = 0;
+    const rtBlockStart = performance.now();
+    for (let i = 0; i < RT_ITERATIONS; i++) {
+      await rtPort.postMessage(RT_MSG);
+      const reply = await rtPort.asyncRead(5000);
+      if (reply) rtBlockCount++;
+    }
+    const rtBlockTime = performance.now() - rtBlockStart;
+    await t3.result;
+
+    const rtBlockLatency = rtBlockTime / RT_ITERATIONS * 1000;
+    const rtBlockMBps = (rtTotalBytes / 1024 / 1024) / (rtBlockTime / 1000);
+    const rtBlockMps = RT_ITERATIONS / (rtBlockTime / 1000);
+    rtResults.push({ name: 'SABMessagePort blocking', time: rtBlockTime, latency: rtBlockLatency, mbps: rtBlockMBps, mps: rtBlockMps });
+    test('RT SAB blocking: all round-trips', rtBlockCount === RT_ITERATIONS);
+    perf(`3. SABMessagePort blocking`, `${rtBlockTime.toFixed(1)}ms, ${rtBlockLatency.toFixed(1)}µs/rt, ${Math.round(rtBlockMps)} msg/s, ${rtBlockMBps.toFixed(2)} MB/s`);
+  }
+
+  // 4. MWChannel blocking worker round-trip
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const w = new Worker(__filename);
+
+    let readyResolve, blockingResolve, resultResolve, resultReject;
+    const readyPromise = new Promise(r => { readyResolve = r; });
+    const blockingPromise = new Promise(r => { blockingResolve = r; });
+    const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+    const rtTimeout = setTimeout(() => { w.terminate(); resultReject(new Error('Timeout')); }, 60000);
+    w.on('message', msg => {
+      if (msg.status === 'ready') readyResolve();
+      else if (msg.status === 'blocking') blockingResolve();
+      else if (msg.result !== undefined) { clearTimeout(rtTimeout); resultResolve(msg.result); }
+      else if (msg.error) { clearTimeout(rtTimeout); resultReject(new Error(msg.error)); }
+    });
+
+    await readyPromise;
+    w.postMessage({ test: 'test_roundtrip_mw_blocking', mwInit: initMsg, options: { iterations: RT_ITERATIONS } }, transfer);
+    await blockingPromise;
+
+    let rtMwCount = 0;
+    const rtMwStart = performance.now();
+
+    await new Promise((resolve) => {
+      mw.onmessage = (e) => {
+        rtMwCount++;
+        if (rtMwCount < RT_ITERATIONS) {
+          mw.postMessage(RT_MSG);
+        } else {
+          mw.onmessage = null;
+          resolve();
+        }
+      };
+      mw.postMessage(RT_MSG);
+    });
+
+    const rtMwTime = performance.now() - rtMwStart;
+    await resultPromise;
+    w.terminate();
+
+    const rtMwLatency = rtMwTime / RT_ITERATIONS * 1000;
+    const rtMwMBps = (rtTotalBytes / 1024 / 1024) / (rtMwTime / 1000);
+    const rtMwMps = RT_ITERATIONS / (rtMwTime / 1000);
+    rtResults.push({ name: 'MWChannel blocking', time: rtMwTime, latency: rtMwLatency, mbps: rtMwMBps, mps: rtMwMps });
+    test('RT MWChannel: all round-trips', rtMwCount === RT_ITERATIONS);
+    perf(`4. MWChannel blocking`, `${rtMwTime.toFixed(1)}ms, ${rtMwLatency.toFixed(1)}µs/rt, ${Math.round(rtMwMps)} msg/s, ${rtMwMBps.toFixed(2)} MB/s`);
+  }
+
+  // Round-trip ranking
+  rtResults.sort((a, b) => a.time - b.time);
+  const rtFastest = rtResults[0];
+  perf('Ranking', rtResults.map((r, i) =>
+    `${i + 1}. ${r.name}: ${r.latency.toFixed(1)}µs/rt, ${Math.round(r.mps)} msg/s, ${r.mbps.toFixed(2)} MB/s (${(r.time / rtFastest.time).toFixed(2)}x)`
+  ).join(', '));
 
   // ─────────────────────────────────────────────────────────────
   summary();

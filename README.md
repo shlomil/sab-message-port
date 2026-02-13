@@ -17,7 +17,7 @@ npm install sab-message-port
 ```
 
 ```javascript
-import { SABMessagePort, SABPipe } from 'sab-message-port';
+import { SABMessagePort, SABPipe, MWChannel } from 'sab-message-port';
 ```
 
 ## Quick Start
@@ -378,6 +378,159 @@ Returns `true` if the pipe has been disposed (by either side).
 
 ---
 
+## MWChannel
+
+A hybrid channel that uses the best transport for each direction: **native `MessagePort`** for worker→main (faster, no SharedArrayBuffer overhead) and **SABPipe** for main→worker (enables blocking reads). The worker can also switch to receiving via `MessagePort` when blocking reads aren't needed.
+
+`SABMessagePort` uses SABPipe in both directions — which means worker→main messages pay the SABPipe serialization cost even though the worker never needs to block on outgoing messages. `MWChannel` avoids this by using native `postMessage` for the worker→main direction, where it's typically faster, while keeping SABPipe for the main→worker direction where blocking reads are the whole point.
+
+The worker can also switch between blocking (SABPipe) and non-blocking (MessagePort) receive modes at runtime for the main→worker direction.
+
+**Key design:**
+- **Worker→main:** Always uses native `MessagePort` (faster, no SABPipe overhead).
+- **Main→worker:** Uses SABPipe by default (enables `read()`/`tryRead()` on the worker). Can be switched to native `MessagePort` when blocking reads aren't needed.
+- The main thread **always receives via native `MessagePort`** and never blocks.
+
+### `new MWChannel(side, sabSizeKB = 128)`
+
+Creates a new channel.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `side` | (required) | `'m'` (main thread) or `'w'` (worker). Throws if invalid. |
+| `sabSizeKB` | `128` | SABPipe buffer size in KB. Main side only. |
+
+```javascript
+const port = new MWChannel('m');         // 128 KB SABPipe buffer
+const port = new MWChannel('m', 256);   // 256 KB SABPipe buffer
+```
+
+### `MWChannel.from(initMsg)`
+
+Creates the worker side from a received init message. The init message must have `type: 'MWChannel'`.
+
+The worker starts in **blocking mode** by default.
+
+```javascript
+self.onmessage = (e) => {
+  if (e.data.type === 'MWChannel') {
+    const port = MWChannel.from(e.data);
+    // ready — defaults to blocking mode
+  }
+};
+```
+
+### `port.postInit(target = null, extraProps = {})`
+
+Sends the SAB and a `MessagePort` to the other side. The init message contains `{ type: 'MWChannel', buffer, port, ...extraProps }`. The `MessagePort` is included in the transfer list.
+
+If `target` is `null`, returns `[msg, transferList]` for manual sending.
+
+```javascript
+// Auto-send to worker
+port.postInit(worker, { channel: 'events' });
+
+// Manual
+const [msg, transfer] = port.postInit(null);
+worker.postMessage(msg, transfer);
+```
+
+### `port.postMessage(msg)`
+
+**Main side:** Sends via SABPipe (blocking mode) or native `MessagePort` (nonblocking mode), depending on the current mode. Returns a `Promise` in blocking mode, `undefined` in nonblocking mode.
+
+**Worker side:** Always sends via native `MessagePort`. Returns `undefined`.
+
+### `port.onmessage`
+
+**Main side:** Event handler on the native `MessagePort`. Always active — the main thread never blocks. Handler receives `{ data: message }`.
+
+**Worker side:** Only available in **nonblocking mode**. Delegates to `MessagePort.onmessage`. Setting `onmessage` in blocking mode throws — use `read()`/`tryRead()` instead.
+
+### `port.read(timeout = Infinity, blocking = true, maxMessages = 1)`
+
+**Worker side, blocking mode only.** Synchronous read from the SABPipe. Same return-value convention as [`SABPipe.read()`](#readerreadtimeout--infinity-blocking--true-maxmessages--1). Throws if called on main side or in nonblocking mode.
+
+### `port.tryRead(maxMessages = 1)`
+
+**Worker side, blocking mode only.** Non-blocking read from the SABPipe. Throws if called on main side or in nonblocking mode.
+
+### `port.asyncRead(timeout = Infinity, maxMessages = 1)`
+
+**Worker side, blocking mode only.** Async read from the SABPipe. Throws if called on main side or in nonblocking mode.
+
+### `port.setMode(mode)`
+
+Switches the transport mode. `mode` must be `'blocking'` or `'nonblocking'`. No-op if already in the requested mode.
+
+**Main side:** Switches the **send** transport. `'blocking'` sends via SABPipe, `'nonblocking'` sends via native `MessagePort`.
+
+**Worker side:** Switches the **receive** transport.
+
+Switching to `'blocking'`:
+1. Detaches the `onmessage` handler from the native `MessagePort`.
+2. Sets mode to `'blocking'` — `read()`/`tryRead()`/`asyncRead()` become available.
+
+Switching to `'nonblocking'`:
+1. Drains any pending messages from the SABPipe via `tryRead()`.
+2. Sets mode to `'nonblocking'` — `onmessage` becomes available.
+3. Drained messages are delivered to the `onmessage` handler when it is set.
+
+**Mode switching is not automatic** — the programmer is responsible for coordinating both sides. The typical pattern is:
+
+1. Worker sends an RPC to tell main which mode to use for sending.
+2. Main calls `port.setMode(newMode)` to switch its send transport.
+3. Worker calls `port.setMode(newMode)` to switch its receive transport.
+
+### `port.close()`
+
+Destroys the SABPipe and closes the native `MessagePort`. All subsequent operations throw.
+
+### `port.buffer` → `SharedArrayBuffer`
+
+The underlying SABPipe buffer.
+
+### MWChannel Usage Example
+
+```javascript
+// === Main thread ===
+import { MWChannel } from 'sab-message-port';
+
+const worker = new Worker('./worker.js', { type: 'module' });
+const port = new MWChannel('m');
+port.postInit(worker, { channel: 'events' });
+
+port.onmessage = (e) => { /* worker→main always arrives here */ };
+
+// Send in blocking mode (default — worker reads via SABPipe)
+port.postMessage(events);
+
+// Worker requests nonblocking mode:
+port.setMode('nonblocking');
+port.postMessage(events);  // now sent via native MessagePort
+
+// === Worker ===
+import { MWChannel } from 'sab-message-port';
+
+self.onmessage = (e) => {
+  if (e.data.type !== 'MWChannel') return;
+  const port = MWChannel.from(e.data);
+
+  // Start in blocking mode (default)
+  while (running) {
+    const events = port.read();  // blocks via SABPipe
+    for (const evt of events) handle(evt);
+  }
+
+  // Switch to nonblocking
+  port.postMessage({ cmd: 'set_mode', mode: 'nonblocking' }); // tell main
+  port.setMode('nonblocking');
+  port.onmessage = (e) => handle(e.data);
+};
+```
+
+---
+
 ## Message Batching
 
 When the writer side calls `postMessage()` multiple times in quick succession (without awaiting), messages are **batched** into a single payload and sent together over the shared buffer. On the reader side, these batched messages are unpacked into an internal queue and delivered one at a time.
@@ -429,6 +582,36 @@ Sustained throughput (3 second run, ~500 byte messages):
 | Async read | ~50,000 msg/s | ~25 MB/s |
 
 Blocking reads are faster because `Atomics.wait` wakes with lower latency than the async event loop. Use blocking reads in worker threads for maximum performance; use async reads on the main thread or when you need to interleave with other async work.
+
+### Round-Trip Comparison
+
+Bidirectional echo test — main sends a message, worker echoes it back, repeat. 1000 round-trips, 118-byte messages. Node.js worker threads.
+
+| Configuration | Avg Latency | Messages/sec | Throughput | Relative |
+|---------------|-------------|-------------|------------|----------|
+| MWChannel (blocking worker) | ~16 µs/rt | ~63,000 msg/s | ~14 MB/s | 1.00x |
+| Native MessagePort | ~18 µs/rt | ~56,000 msg/s | ~13 MB/s | 1.15x |
+| SABMessagePort (blocking worker) | ~23 µs/rt | ~43,000 msg/s | ~10 MB/s | 1.49x |
+| SABMessagePort (async both sides) | ~26 µs/rt | ~38,000 msg/s | ~9 MB/s | 1.66x |
+
+MWChannel wins because it combines blocking `Atomics.wait` reads (low wake-up latency) with native `MessagePort` writes (zero SABPipe overhead for the worker→main direction). SABMessagePort pays the SABPipe cost in both directions.
+
+*Measured with Node.js.*
+
+### Round-Trip Comparison (Chrome)
+
+Same test, Chrome 137 with cross-origin isolation headers.
+
+| Configuration | Avg Latency | Messages/sec | Throughput | Relative |
+|---------------|-------------|-------------|------------|----------|
+| Native MessagePort | ~33 µs/rt | ~30,000 msg/s | ~6.8 MB/s | 1.00x |
+| MWChannel (blocking worker) | ~46 µs/rt | ~21,500 msg/s | ~4.9 MB/s | 1.40x |
+| SABMessagePort (blocking worker) | ~47 µs/rt | ~21,300 msg/s | ~4.8 MB/s | 1.41x |
+| SABMessagePort (async both sides) | ~66 µs/rt | ~15,100 msg/s | ~3.4 MB/s | 1.99x |
+
+In Chrome, native `MessagePort` is fastest for round-trips. MWChannel and SABMessagePort blocking are nearly identical — Chrome's `Atomics.wait` wake-up latency is higher than Node.js, reducing the advantage of blocking reads. Async SABMessagePort remains the slowest at ~2x.
+
+*Measured with Chrome.*
 
 ## Requirements
 

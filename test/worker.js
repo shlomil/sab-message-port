@@ -2,7 +2,7 @@
  * SABPipe Test Worker (Browser)
  */
 
-import { SABPipe, SABMessagePort } from '../src/SABMessagePort.js';
+import { SABPipe, SABMessagePort, MWChannel } from '../src/SABMessagePort.js';
 
 const handlers = {
   // Basic read and echo
@@ -304,6 +304,28 @@ const handlers = {
       };
     });
     self.postMessage({ result: { received: received.length, allOk: received.every((m, i) => m.id === i) } });
+  },
+
+  // --- Round-trip comparison handlers ---
+
+  async test_roundtrip_sab_async(sab, options) {
+    const port = new SABMessagePort('b', sab);
+    const iterations = options.iterations || 1000;
+    for (let i = 0; i < iterations; i++) {
+      const msg = await port.asyncRead(5000);
+      await port.postMessage(msg);
+    }
+    self.postMessage({ result: { count: iterations } });
+  },
+
+  async test_roundtrip_sab_blocking(sab, options) {
+    const port = new SABMessagePort('b', sab);
+    const iterations = options.iterations || 1000;
+    for (let i = 0; i < iterations; i++) {
+      const msg = port.read();
+      await port.postMessage(msg);
+    }
+    self.postMessage({ result: { count: iterations } });
   }
 };
 
@@ -334,6 +356,98 @@ self.onmessage = async (e) => {
         self.postMessage({ result: { count } });
       }
     };
+    return;
+  }
+
+  // --- MWChannel handlers ---
+
+  if (test === 'test_mw_blocking_read') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      const m = port.read(5000);
+      self.postMessage({ result: { received: m, from: 'worker' } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
+    return;
+  }
+
+  if (test === 'test_mw_blocking_multi') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      const count = options.count || 3;
+      const messages = [];
+      for (let i = 0; i < count; i++) {
+        messages.push(port.read(5000));
+      }
+      self.postMessage({ result: { messages } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
+    return;
+  }
+
+  if (test === 'test_mw_worker_sends') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      const count = options.count || 3;
+      for (let i = 0; i < count; i++) {
+        port.postMessage({ id: i, data: `mw-msg-${i}` });
+      }
+      self.postMessage({ result: { sent: count } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
+    return;
+  }
+
+  if (test === 'test_roundtrip_mw_blocking') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      const iterations = options.iterations || 1000;
+      for (let i = 0; i < iterations; i++) {
+        const m = port.read(5000);
+        port.postMessage(m);
+      }
+      self.postMessage({ result: { count: iterations } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
+    return;
+  }
+
+  if (test === 'test_mw_mode_switch') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      // Start in blocking mode (default), read one message
+      const blockingMsg = port.read(5000);
+
+      // Switch to nonblocking
+      port.setMode('nonblocking');
+      const nbReceived = [];
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('mw onmessage timeout')), 5000);
+        port.onmessage = (ev) => {
+          nbReceived.push(ev.data);
+          if (nbReceived.length >= options.nbCount) {
+            clearTimeout(timeout);
+            port.onmessage = null;
+            resolve();
+          }
+        };
+        // Tell main we're ready for nonblocking messages
+        port.postMessage({ status: 'nb_ready' });
+      });
+
+      // Switch back to blocking, read one more
+      port.setMode('blocking');
+      port.postMessage({ status: 'blocking_again' });
+      const blockingMsg2 = port.read(5000);
+
+      self.postMessage({ result: { blockingMsg, nbReceived, blockingMsg2 } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
     return;
   }
 

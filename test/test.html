@@ -39,7 +39,7 @@
   <div id="output"></div>
 
   <script type="module">
-    import { SABPipe, SABMessagePort } from '../src/SABMessagePort.js';
+    import { SABPipe, SABMessagePort, MWChannel } from '../src/SABMessagePort.js';
 
     // ════════════════════════════════════════════════════════════════
     // Test Framework
@@ -1279,6 +1279,385 @@
       let bidiReadAfterClose = null;
       try { await bidiClose.asyncRead(0); } catch (e) { bidiReadAfterClose = e; }
       test('bidi close: asyncRead throws', bidiReadAfterClose !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: Construction');
+      // ─────────────────────────────────────────────────────────────
+
+      const mw1 = new MWChannel('m');
+      test('mw: default creates 128KB SAB', mw1.buffer.byteLength === 128 * 1024);
+
+      const mw2 = new MWChannel('m', 256);
+      test('mw: custom size 256KB', mw2.buffer.byteLength === 256 * 1024);
+
+      let mwSideError = null;
+      try { new MWChannel('x'); } catch (e) { mwSideError = e; }
+      test('mw: invalid side throws', mwSideError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: postInit / from');
+      // ─────────────────────────────────────────────────────────────
+
+      const mw3 = new MWChannel('m');
+      const mwInitArgs = mw3.postInit(null, { channel: 'test' });
+      test('mw: postInit returns array', Array.isArray(mwInitArgs));
+      test('mw: postInit msg has type', mwInitArgs[0].type === 'MWChannel');
+      test('mw: postInit msg has buffer', mwInitArgs[0].buffer === mw3.buffer);
+      test('mw: postInit msg has port', mwInitArgs[0].port !== undefined);
+      test('mw: postInit msg has extraProps', mwInitArgs[0].channel === 'test');
+      test('mw: postInit transfer has port', mwInitArgs[1].length === 1);
+
+      let mwFromError = null;
+      try { MWChannel.from({ type: 'wrong' }); } catch (e) { mwFromError = e; }
+      test('mw: from() rejects invalid', mwFromError !== null);
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: Blocking Read');
+      // ─────────────────────────────────────────────────────────────
+
+      {
+        const mw = new MWChannel('m');
+        const [initMsg, transfer] = mw.postInit(null);
+        const worker = createWorker();
+        await waitForWorkerReady(worker);
+
+        const resultPromise = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Timeout')), 5000);
+          worker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+        worker.postMessage({ test: 'test_mw_blocking_read', mwInit: initMsg, options: {} }, transfer);
+        // Small delay to let worker enter blocking read
+        await new Promise(r => setTimeout(r, 50));
+        await mw.postMessage({ greeting: 'hello-mw', num: 99 });
+        const mwResult1 = await resultPromise;
+
+        test('mw blocking: received message', mwResult1.received !== null);
+        assertEqual('mw blocking: content', mwResult1.received?.greeting, 'hello-mw');
+        assertEqual('mw blocking: number', mwResult1.received?.num, 99);
+        test('mw blocking: from worker', mwResult1.from === 'worker');
+        worker.terminate();
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: Multiple Blocking Reads');
+      // ─────────────────────────────────────────────────────────────
+
+      {
+        const mw = new MWChannel('m');
+        const [initMsg, transfer] = mw.postInit(null);
+        const worker = createWorker();
+        await waitForWorkerReady(worker);
+
+        const resultPromise = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Timeout')), 5000);
+          worker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+        worker.postMessage({ test: 'test_mw_blocking_multi', mwInit: initMsg, options: { count: 3 } }, transfer);
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 3; i++) {
+          await mw.postMessage({ id: i, data: `msg-${i}` });
+        }
+        const mwResult2 = await resultPromise;
+
+        test('mw multi: received all 3', mwResult2.messages.length === 3);
+        test('mw multi: correct order', mwResult2.messages.every((m, i) => m.id === i));
+        worker.terminate();
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: Worker Sends via MessagePort');
+      // ─────────────────────────────────────────────────────────────
+
+      {
+        const mw = new MWChannel('m');
+        const [initMsg, transfer] = mw.postInit(null);
+        const worker = createWorker();
+        await waitForWorkerReady(worker);
+
+        const resultPromise = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Timeout')), 5000);
+          worker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+        worker.postMessage({ test: 'test_mw_worker_sends', mwInit: initMsg, options: { count: 3 } }, transfer);
+
+        const received = [];
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('mw receive timeout')), 5000);
+          mw.onmessage = (e) => {
+            received.push(e.data);
+            if (received.length >= 3) {
+              clearTimeout(t);
+              mw.onmessage = null;
+              resolve();
+            }
+          };
+        });
+        await resultPromise;
+
+        test('mw worker sends: received all 3', received.length === 3);
+        test('mw worker sends: correct order', received.every((m, i) => m.id === i));
+        assertEqual('mw worker sends: content', received[0].data, 'mw-msg-0');
+        worker.terminate();
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: Mode Switching');
+      // ─────────────────────────────────────────────────────────────
+
+      {
+        const mw = new MWChannel('m');
+        const [initMsg, transfer] = mw.postInit(null);
+        const worker = createWorker();
+        await waitForWorkerReady(worker);
+
+        const resultPromise = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Timeout')), 10000);
+          worker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+        worker.postMessage({ test: 'test_mw_mode_switch', mwInit: initMsg, options: { nbCount: 2 } }, transfer);
+
+        // Phase 1: Send one message in blocking mode (SABPipe)
+        await new Promise(r => setTimeout(r, 50));
+        await mw.postMessage({ phase: 'blocking', id: 0 });
+
+        // Wait for worker to switch to nonblocking and signal ready
+        await new Promise((resolve) => {
+          mw.onmessage = (e) => {
+            if (e.data.status === 'nb_ready') {
+              mw.onmessage = null;
+              resolve();
+            }
+          };
+        });
+
+        // Phase 2: Switch main to nonblocking mode, send via native port
+        mw.setMode('nonblocking');
+        mw.postMessage({ phase: 'nonblocking', id: 1 });
+        mw.postMessage({ phase: 'nonblocking', id: 2 });
+
+        // Wait for worker to switch back to blocking and signal
+        await new Promise((resolve) => {
+          mw.onmessage = (e) => {
+            if (e.data.status === 'blocking_again') {
+              mw.onmessage = null;
+              resolve();
+            }
+          };
+        });
+
+        // Phase 3: Switch main back to blocking mode, send via SABPipe
+        mw.setMode('blocking');
+        await mw.postMessage({ phase: 'blocking2', id: 3 });
+
+        const mwResult4 = await resultPromise;
+
+        assertEqual('mw mode switch: blocking msg', mwResult4.blockingMsg?.phase, 'blocking');
+        test('mw mode switch: nb received 2', mwResult4.nbReceived.length === 2);
+        test('mw mode switch: nb correct', mwResult4.nbReceived.every((m, i) => m.id === i + 1));
+        assertEqual('mw mode switch: blocking2 msg', mwResult4.blockingMsg2?.phase, 'blocking2');
+        worker.terminate();
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      group('MWChannel: close');
+      // ─────────────────────────────────────────────────────────────
+
+      {
+        const mw = new MWChannel('m');
+        mw.close();
+        let mwWriteAfterClose = null;
+        try { await mw.postMessage({ test: 1 }); } catch (e) { mwWriteAfterClose = e; }
+        test('mw close: postMessage throws', mwWriteAfterClose !== null);
+      }
+
+      // ─────────────────────────────────────────────────────────────
+      group('Round-Trip Comparison');
+      // ─────────────────────────────────────────────────────────────
+
+      const RT_ITERATIONS = 1000;
+      const RT_MSG = { id: 0, data: 'x'.repeat(100) };
+      const rtMsgBytes = JSON.stringify(RT_MSG).length;
+      const rtTotalBytes = rtMsgBytes * 2 * RT_ITERATIONS; // both directions
+      const rtResults = [];
+
+      perf('Config', `${RT_ITERATIONS} round-trips, msg size: ${rtMsgBytes} bytes`);
+
+      // 1. Native MessagePort round-trip
+      {
+        const rtNativeWorker = createWorker();
+        await waitForWorkerReady(rtNativeWorker);
+        const rtChannel = new MessageChannel();
+
+        const rtNativeResult = new Promise((resolve, reject) => {
+          const t = setTimeout(() => { rtNativeWorker.terminate(); reject(new Error('Timeout')); }, 60000);
+          const h = (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); rtNativeWorker.removeEventListener('message', h); resolve(e.data.result); }
+          };
+          rtNativeWorker.addEventListener('message', h);
+        });
+
+        rtNativeWorker.postMessage(
+          { test: 'test_perf_messageport', options: { iterations: RT_ITERATIONS }, port: rtChannel.port2 },
+          [rtChannel.port2]
+        );
+
+        let rtNativeCount = 0;
+        const rtNativeStart = performance.now();
+
+        await new Promise(resolve => {
+          rtChannel.port1.onmessage = () => {
+            rtNativeCount++;
+            if (rtNativeCount < RT_ITERATIONS) {
+              rtChannel.port1.postMessage(RT_MSG);
+            } else {
+              resolve();
+            }
+          };
+          rtChannel.port1.postMessage(RT_MSG);
+        });
+
+        const rtNativeTime = performance.now() - rtNativeStart;
+        await rtNativeResult;
+        rtNativeWorker.terminate();
+        rtChannel.port1.close();
+
+        const rtNativeLatency = rtNativeTime / RT_ITERATIONS * 1000;
+        const rtNativeMBps = (rtTotalBytes / 1024 / 1024) / (rtNativeTime / 1000);
+        const rtNativeMps = RT_ITERATIONS / (rtNativeTime / 1000);
+        rtResults.push({ name: 'Native MessagePort', time: rtNativeTime, latency: rtNativeLatency, mbps: rtNativeMBps, mps: rtNativeMps });
+        test('RT native: all round-trips', rtNativeCount === RT_ITERATIONS);
+        perf(`1. Native MessagePort`, `${rtNativeTime.toFixed(1)}ms, ${rtNativeLatency.toFixed(1)}µs/rt, ${Math.round(rtNativeMps)} msg/s, ${rtNativeMBps.toFixed(2)} MB/s`);
+      }
+
+      // 2. SABMessagePort async round-trip
+      {
+        const rtWorker2 = createWorker();
+        await waitForWorkerReady(rtWorker2);
+        const rtSab2 = new SharedArrayBuffer(256 * 1024);
+        const rtPort2 = new SABMessagePort('a', rtSab2);
+
+        const rtPromise2 = runWorkerTest(rtWorker2, 'test_roundtrip_sab_async', rtSab2, {
+          iterations: RT_ITERATIONS, testTimeout: 60000
+        });
+        await new Promise(r => setTimeout(r, 50));
+
+        let rtCount2 = 0;
+        const rtStart2 = performance.now();
+        for (let i = 0; i < RT_ITERATIONS; i++) {
+          await rtPort2.postMessage(RT_MSG);
+          const reply = await rtPort2.asyncRead(5000);
+          if (reply) rtCount2++;
+        }
+        const rtTime2 = performance.now() - rtStart2;
+        await rtPromise2;
+        rtWorker2.terminate();
+
+        const rtLatency2 = rtTime2 / RT_ITERATIONS * 1000;
+        const rtMBps2 = (rtTotalBytes / 1024 / 1024) / (rtTime2 / 1000);
+        const rtMps2 = RT_ITERATIONS / (rtTime2 / 1000);
+        rtResults.push({ name: 'SABMessagePort async', time: rtTime2, latency: rtLatency2, mbps: rtMBps2, mps: rtMps2 });
+        test('RT SAB async: all round-trips', rtCount2 === RT_ITERATIONS);
+        perf(`2. SABMessagePort async`, `${rtTime2.toFixed(1)}ms, ${rtLatency2.toFixed(1)}µs/rt, ${Math.round(rtMps2)} msg/s, ${rtMBps2.toFixed(2)} MB/s`);
+      }
+
+      // 3. SABMessagePort blocking worker round-trip
+      {
+        const rtWorker3 = createWorker();
+        await waitForWorkerReady(rtWorker3);
+        const rtSab3 = new SharedArrayBuffer(256 * 1024);
+        const rtPort3 = new SABMessagePort('a', rtSab3);
+
+        const rtPromise3 = runWorkerTest(rtWorker3, 'test_roundtrip_sab_blocking', rtSab3, {
+          iterations: RT_ITERATIONS, testTimeout: 60000
+        });
+        await new Promise(r => setTimeout(r, 50));
+
+        let rtCount3 = 0;
+        const rtStart3 = performance.now();
+        for (let i = 0; i < RT_ITERATIONS; i++) {
+          await rtPort3.postMessage(RT_MSG);
+          const reply = await rtPort3.asyncRead(5000);
+          if (reply) rtCount3++;
+        }
+        const rtTime3 = performance.now() - rtStart3;
+        await rtPromise3;
+        rtWorker3.terminate();
+
+        const rtLatency3 = rtTime3 / RT_ITERATIONS * 1000;
+        const rtMBps3 = (rtTotalBytes / 1024 / 1024) / (rtTime3 / 1000);
+        const rtMps3 = RT_ITERATIONS / (rtTime3 / 1000);
+        rtResults.push({ name: 'SABMessagePort blocking', time: rtTime3, latency: rtLatency3, mbps: rtMBps3, mps: rtMps3 });
+        test('RT SAB blocking: all round-trips', rtCount3 === RT_ITERATIONS);
+        perf(`3. SABMessagePort blocking`, `${rtTime3.toFixed(1)}ms, ${rtLatency3.toFixed(1)}µs/rt, ${Math.round(rtMps3)} msg/s, ${rtMBps3.toFixed(2)} MB/s`);
+      }
+
+      // 4. MWChannel blocking worker round-trip
+      {
+        const rtMw = new MWChannel('m');
+        const [rtMwInit, rtMwTransfer] = rtMw.postInit(null);
+        const rtMwWorker = createWorker();
+        await waitForWorkerReady(rtMwWorker);
+
+        const rtMwResult = new Promise((resolve, reject) => {
+          const t = setTimeout(() => { rtMwWorker.terminate(); reject(new Error('Timeout')); }, 60000);
+          rtMwWorker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+
+        rtMwWorker.postMessage(
+          { test: 'test_roundtrip_mw_blocking', mwInit: rtMwInit, options: { iterations: RT_ITERATIONS } },
+          rtMwTransfer
+        );
+        await new Promise(r => setTimeout(r, 50));
+
+        let rtMwCount = 0;
+        const rtMwStart = performance.now();
+
+        await new Promise((resolve) => {
+          rtMw.onmessage = (e) => {
+            rtMwCount++;
+            if (rtMwCount < RT_ITERATIONS) {
+              rtMw.postMessage(RT_MSG);
+            } else {
+              rtMw.onmessage = null;
+              resolve();
+            }
+          };
+          rtMw.postMessage(RT_MSG);
+        });
+
+        const rtMwTime = performance.now() - rtMwStart;
+        await rtMwResult;
+        rtMwWorker.terminate();
+
+        const rtMwLatency = rtMwTime / RT_ITERATIONS * 1000;
+        const rtMwMBps = (rtTotalBytes / 1024 / 1024) / (rtMwTime / 1000);
+        const rtMwMps = RT_ITERATIONS / (rtMwTime / 1000);
+        rtResults.push({ name: 'MWChannel blocking', time: rtMwTime, latency: rtMwLatency, mbps: rtMwMBps, mps: rtMwMps });
+        test('RT MWChannel: all round-trips', rtMwCount === RT_ITERATIONS);
+        perf(`4. MWChannel blocking`, `${rtMwTime.toFixed(1)}ms, ${rtMwLatency.toFixed(1)}µs/rt, ${Math.round(rtMwMps)} msg/s, ${rtMwMBps.toFixed(2)} MB/s`);
+      }
+
+      // Round-trip ranking
+      rtResults.sort((a, b) => a.time - b.time);
+      const rtFastest = rtResults[0];
+      perf('Ranking', rtResults.map((r, i) =>
+        `${i + 1}. ${r.name}: ${r.latency.toFixed(1)}µs/rt, ${Math.round(r.mps)} msg/s, ${r.mbps.toFixed(2)} MB/s (${(r.time / rtFastest.time).toFixed(2)}x)`
+      ).join(', '));
 
       // ─────────────────────────────────────────────────────────────
       summary();

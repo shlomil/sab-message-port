@@ -800,3 +800,188 @@ export class SABMessagePort {
     return this._sab;
   }
 }
+
+
+// ════════════════════════════════════════════════════════════════
+// MWChannel — MessagePort + SABPipe Wrapper
+//
+// Combines a native MessagePort with a SABPipe pair, allowing the
+// worker side to switch between non-blocking (MessagePort) and
+// blocking (SABPipe) receive modes at runtime.
+// Main thread always receives via MessagePort (never blocks).
+// Worker always sends via MessagePort (worker→main is always non-blocking).
+// The SABPipe is one-directional: main→worker only.
+// ════════════════════════════════════════════════════════════════
+
+export class MWChannel {
+
+  /**
+   * @param {'m'|'w'} side - 'm' (main thread) or 'w' (worker thread)
+   * @param {number} sabSizeKB - SABPipe buffer size in KB (default 128). Main side only.
+   */
+  constructor(side, sabSizeKB = 128) {
+    if (side !== 'm' && side !== 'w') throw new Error("side must be 'm' or 'w'");
+    this._side = side;
+    this._mode = 'blocking'; // default: worker starts in blocking mode
+    this._onmessage = null;
+    this._pendingDrain = [];
+
+    if (side === 'm') {
+      this._sab = new SharedArrayBuffer(sabSizeKB * 1024);
+      this._channel = new MessageChannel();
+      this._nativePort = this._channel.port1;
+      this._sabWriter = new SABPipe('w', this._sab);
+    }
+    // Worker side: _sab, _nativePort, _sabReader initialized by from()
+  }
+
+  /**
+   * Creates the worker side from a received init message.
+   * @param {object} initMsg - Must have type='MWChannel', buffer, port
+   */
+  static from(initMsg) {
+    if (initMsg?.type !== 'MWChannel') {
+      throw new Error('Not a MWChannel init message');
+    }
+    const mw = new MWChannel('w');
+    mw._sab = initMsg.buffer;
+    mw._nativePort = initMsg.port;
+    mw._sabReader = new SABPipe('r', mw._sab);
+    mw._nativePort.start();
+    return mw;
+  }
+
+  /**
+   * Sends init message containing the SAB and a MessagePort to the other side.
+   * If target is null, returns [msg, transferList] for manual sending.
+   */
+  postInit(target = null, extraProps = {}) {
+    if (this._side !== 'm') throw new Error('postInit is only for main side');
+    const port2 = this._channel.port2;
+    const msg = { type: 'MWChannel', buffer: this._sab, port: port2, ...extraProps };
+    const transfer = [port2];
+    if (target === null) return [msg, transfer];
+    target.postMessage(msg, transfer);
+  }
+
+  /**
+   * Send a message.
+   * Main: sends via SABPipe (blocking mode) or native MessagePort (nonblocking mode).
+   * Worker: always sends via native MessagePort.
+   */
+  postMessage(msg) {
+    if (this._side === 'm') {
+      if (this._mode === 'blocking') {
+        return this._sabWriter.postMessage(msg);
+      } else {
+        this._nativePort.postMessage(msg);
+      }
+    } else {
+      this._nativePort.postMessage(msg);
+    }
+  }
+
+  /**
+   * Event handler for incoming messages.
+   * Main: always delegates to native MessagePort.onmessage.
+   * Worker: only available in nonblocking mode (throws in blocking mode).
+   */
+  set onmessage(handler) {
+    if (this._side === 'm') {
+      this._onmessage = handler;
+      this._nativePort.onmessage = handler;
+    } else {
+      if (this._mode === 'blocking') {
+        throw new Error('Cannot set onmessage in blocking mode — use read()/tryRead()');
+      }
+      this._onmessage = handler;
+      // Deliver any pending drained messages from mode switch
+      if (handler && this._pendingDrain.length > 0) {
+        const pending = this._pendingDrain;
+        this._pendingDrain = [];
+        for (const msg of pending) {
+          try { handler({ data: msg }); } catch (e) { /* handler errors don't break setup */ }
+        }
+      }
+      this._nativePort.onmessage = handler;
+    }
+  }
+
+  get onmessage() {
+    return this._onmessage;
+  }
+
+  /**
+   * Blocking synchronous read from SABPipe. Worker side, blocking mode only.
+   */
+  read(timeout, blocking, max_num_messages) {
+    if (this._side !== 'w') throw new Error('read() is only for worker side');
+    if (this._mode !== 'blocking') throw new Error('read() only available in blocking mode');
+    return this._sabReader.read(timeout, blocking, max_num_messages);
+  }
+
+  /**
+   * Non-blocking read from SABPipe. Worker side, blocking mode only.
+   */
+  tryRead(max_num_messages) {
+    if (this._side !== 'w') throw new Error('tryRead() is only for worker side');
+    if (this._mode !== 'blocking') throw new Error('tryRead() only available in blocking mode');
+    return this._sabReader.tryRead(max_num_messages);
+  }
+
+  /**
+   * Async read from SABPipe. Worker side, blocking mode only.
+   */
+  asyncRead(timeout, max_num_messages) {
+    if (this._side !== 'w') throw new Error('asyncRead() is only for worker side');
+    if (this._mode !== 'blocking') throw new Error('asyncRead() only available in blocking mode');
+    return this._sabReader.asyncRead(timeout, max_num_messages);
+  }
+
+  /**
+   * Switch mode.
+   * Main: switches send transport ('blocking' = SABPipe, 'nonblocking' = native MessagePort).
+   * Worker: switches receive transport ('blocking' = SABPipe reads, 'nonblocking' = MessagePort onmessage).
+   */
+  setMode(mode) {
+    if (mode !== 'blocking' && mode !== 'nonblocking') {
+      throw new Error("mode must be 'blocking' or 'nonblocking'");
+    }
+    if (this._mode === mode) return;
+
+    if (this._side === 'm') {
+      this._mode = mode;
+    } else {
+      // Worker side
+      if (mode === 'blocking') {
+        // Switching to blocking: detach native port handler
+        this._nativePort.onmessage = null;
+        this._onmessage = null;
+        this._mode = 'blocking';
+      } else {
+        // Switching to nonblocking: drain SABPipe
+        let msg;
+        while ((msg = this._sabReader.tryRead()) !== null) {
+          this._pendingDrain.push(msg);
+        }
+        this._mode = 'nonblocking';
+      }
+    }
+  }
+
+  /**
+   * Close the channel. Destroys SABPipe and closes native MessagePort.
+   */
+  close() {
+    if (this._side === 'm') {
+      this._sabWriter.destroy();
+    } else {
+      this._sabReader.destroy();
+    }
+    this._nativePort.close();
+  }
+
+  get buffer() {
+    return this._sab;
+  }
+}
