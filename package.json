@@ -1,6 +1,6 @@
 {
   "name": "sab-message-port",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Worker IPC over SharedArrayBuffer — blocking reads without the event loop",
   "type": "module",
   "exports": {

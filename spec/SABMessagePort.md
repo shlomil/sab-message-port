@@ -1,8 +1,9 @@
-# SABPipe & SABMessagePort Specification
+# SABPipe, SABMessagePort & MWChannel Specification
 
-Two-layer SharedArrayBuffer communication library:
+SharedArrayBuffer communication library with three layers:
 - **SABPipe** — Unidirectional channel with buffered queues and promise-based write completion
 - **SABMessagePort** — Bidirectional wrapper over two SABPipe instances (mirrors native `MessagePort` API)
+- **MWChannel** — Hybrid main↔worker channel combining native MessagePort with SABPipe for switchable blocking/nonblocking modes
 
 ## Overview
 
@@ -400,6 +401,24 @@ tryRead(max_num_messages = 1) {
 - Convenience wrapper for non-blocking reads
 - Returns `null` (if `max_num_messages == 1`) or empty array (if `> 1`) when no messages available
 
+### `tryPeek()` → `*|null`
+
+```javascript
+// Non-blocking peek - returns the next message without removing it from the queue
+tryPeek() {
+  // 1. Check reader role and onmessage mutual exclusion
+  // 2. Check disposed
+  // 3. If read_queue is empty, attempt a non-blocking _read(false, 0) to populate it
+  // 4. Return read_queue[length - 1] (oldest = next to be processed) without popping, or null
+}
+```
+
+- Returns the next message that `read()` or `tryRead()` would return, **without removing it** from the queue
+- If the queue is empty, performs a non-blocking low-level `_read(false, 0)` to check for new data in the SAB
+- Returns `null` if no messages are available
+- Always returns a single message (no `max_num_messages` parameter)
+- Subject to `onmessage` mutual exclusion (throws if `onmessage` is active)
+
 ### `asyncRead(timeout, max_num_messages = 1)` → `Promise` (main-thread safe)
 
 ```javascript
@@ -414,6 +433,17 @@ async asyncRead(timeout = Infinity, max_num_messages = 1) {
 - Same return semantics as `read()`: single message/`null` (max=1) or array (max>1)
 - Safe to call from main thread (no `Atomics.wait`)
 - Timeout applies only to the initial wait (fresh-read); multipart waits are unbounded
+
+### `isDisposed()` → `boolean`
+
+```javascript
+isDisposed() {
+  return this.i32 === null || this.i32[STATUS] === STATUS_DISPOSED;
+}
+```
+
+- Returns `true` if the pipe has been destroyed locally or disposed by the other side
+- Does **not** throw — safe to call at any time as a status check
 
 ### `close()` / `destroy()`
 
@@ -502,12 +532,12 @@ async _messageLoop() {
 
 **Mutual exclusion with manual reads:**
 
-When `onmessage` is active, calling `read()`, `tryRead()`, or `asyncRead()` throws an error — they would compete for the same `_read_queue`.
+When `onmessage` is active, calling `read()`, `tryRead()`, `tryPeek()`, or `asyncRead()` throws an error — they would compete for the same `_read_queue`.
 
 ```javascript
-// In read(), tryRead(), asyncRead():
+// In read(), tryRead(), tryPeek(), asyncRead():
 if (this._onmessage !== null) {
-  throw new Error('Cannot call read/asyncRead while onmessage is active');
+  throw new Error('Cannot call read/tryPeek/asyncRead while onmessage is active');
 }
 ```
 
@@ -725,6 +755,10 @@ read(timeout, blocking, max_num_messages) {
 tryRead(max_num_messages) {
   return this._reader.tryRead(max_num_messages);
 }
+
+tryPeek() {
+  return this._reader.tryPeek();
+}
 ```
 
 **Lifecycle:**
@@ -763,6 +797,257 @@ self.onmessage = (e) => {
       if (e.data.cmd === 'ping') {
         port.postMessage({ reply: 'pong' });
       }
+    };
+  }
+};
+```
+
+---
+
+## MWChannel
+
+Hybrid communication channel that combines a native `MessagePort` with a `SABPipe`, giving the worker side a choice between non-blocking (MessagePort) and blocking (SABPipe) receive modes at runtime.
+
+### Overview
+
+MWChannel addresses a common pattern where the main thread needs to send messages to a worker that may operate in either a blocking event-loop (using `Atomics.wait`) or a standard async event-loop. The worker always sends back via native `MessagePort` (non-blocking), while the main thread's send path depends on the current mode.
+
+```
+Main thread                          Worker thread
+┌─────────────────────┐              ┌─────────────────────┐
+│                     │──SABPipe────▶│  (blocking mode)    │
+│  MWChannel('m')     │              │  MWChannel('w')     │
+│                     │──MsgPort────▶│  (nonblocking mode) │
+│                     │◀──MsgPort───│  (always MsgPort)   │
+└─────────────────────┘              └─────────────────────┘
+```
+
+| Direction | Transport | Notes |
+|-----------|-----------|-------|
+| Main → Worker (blocking mode) | SABPipe | Worker can use `read()`, `tryRead()`, `tryPeek()`, `asyncRead()` |
+| Main → Worker (nonblocking mode) | Native MessagePort | Worker receives via `onmessage` |
+| Worker → Main (always) | Native MessagePort | Main receives via `onmessage` |
+
+### Design Principles
+
+- **Asymmetric by design**: Main thread never blocks; worker can choose to block
+- **Single SABPipe direction**: Only main→worker uses SharedArrayBuffer (one SABPipe writer on main, one SABPipe reader on worker)
+- **Runtime mode switching**: Worker can switch between blocking and nonblocking receive modes via `setMode()`
+- **Drain on mode switch**: When switching from blocking to nonblocking, any messages remaining in the SABPipe read queue are drained and delivered to the `onmessage` handler
+
+### Constructor
+
+```javascript
+constructor(side, sabSizeKB = 128)
+```
+
+**Parameters:**
+- `side` (required): `'m'` (main thread) or `'w'` (worker thread)
+- `sabSizeKB` (optional): SABPipe buffer size in KB (default: 128). Only used on the main side (creates the SharedArrayBuffer).
+
+**Internal construction (main side):**
+
+```javascript
+constructor('m', sabSizeKB = 128) {
+  this._sab = new SharedArrayBuffer(sabSizeKB * 1024);
+  this._channel = new MessageChannel();
+  this._nativePort = this._channel.port1;
+  this._sabWriter = new SABPipe('w', this._sab);
+  this._mode = 'blocking';       // default mode
+  this._onmessage = null;
+  this._pendingDrain = [];
+}
+```
+
+The worker side is not constructed directly — it is created via `MWChannel.from()`.
+
+### Factory: `MWChannel.from(initMsg)`
+
+Static factory that creates the worker side from a received init message.
+
+```javascript
+static from(initMsg) {
+  if (initMsg?.type !== 'MWChannel') {
+    throw new Error('Not a MWChannel init message');
+  }
+  const mw = new MWChannel('w');
+  mw._sab = initMsg.buffer;
+  mw._nativePort = initMsg.port;
+  mw._sabReader = new SABPipe('r', mw._sab);
+  mw._nativePort.start();
+  return mw;
+}
+```
+
+- Creates a worker-side MWChannel with a SABPipe reader and the transferred MessagePort
+- Calls `port.start()` to begin receiving native messages (needed for transferred MessagePort instances)
+
+### Serialization: `postInit(target?, extraProps?)`
+
+Sends the SAB, a MessagePort, and layout info to the worker via native `postMessage`.
+
+```javascript
+postInit(target = null, extraProps = {}) {
+  const port2 = this._channel.port2;
+  const msg = { type: 'MWChannel', buffer: this._sab, port: port2, ...extraProps };
+  const transfer = [port2];
+  if (target === null) return [msg, transfer];
+  target.postMessage(msg, transfer);
+}
+```
+
+**Parameters:**
+- `target` (optional): Object with `.postMessage(data, transfer)` (Worker, etc.). If `null`, returns `[msg, transfer]` for manual sending.
+- `extraProps` (optional): Additional properties merged into the init message
+
+**Note:** Main-side only. The transfer list includes `port2` (the worker's end of the MessageChannel).
+
+### High-Level API
+
+#### `postMessage(msg)`
+
+```javascript
+postMessage(msg) {
+  if (side === 'm') {
+    // blocking mode: send via SABPipe (returns Promise)
+    // nonblocking mode: send via native MessagePort (returns undefined)
+  } else {
+    // worker: always sends via native MessagePort (returns undefined)
+  }
+}
+```
+
+- **Main side**: Uses SABPipe in blocking mode (returns a `Promise` that resolves when written), or native MessagePort in nonblocking mode (returns `undefined`)
+- **Worker side**: Always uses native MessagePort regardless of mode
+
+#### `onmessage` (property)
+
+```javascript
+set onmessage(handler) { ... }
+get onmessage() { return this._onmessage; }
+```
+
+- **Main side**: Delegates directly to the native MessagePort's `onmessage`. Always available.
+- **Worker side**: Only available in **nonblocking** mode. Throws if set in blocking mode.
+  - When a handler is set, any pending drain messages (from a blocking→nonblocking mode switch) are delivered immediately before attaching to the native port.
+
+#### `read(timeout, blocking, max_num_messages)` — worker, blocking mode only
+
+```javascript
+read(timeout, blocking, max_num_messages) {
+  // Delegates to this._sabReader.read(...)
+}
+```
+
+- Worker side only. Throws if called from main side or in nonblocking mode.
+- Same semantics as `SABPipe.read()`
+
+#### `tryRead(max_num_messages)` — worker, blocking mode only
+
+```javascript
+tryRead(max_num_messages) {
+  // Delegates to this._sabReader.tryRead(...)
+}
+```
+
+- Worker side only. Throws if called from main side or in nonblocking mode.
+- Same semantics as `SABPipe.tryRead()`
+
+#### `tryPeek()` — worker, blocking mode only
+
+```javascript
+tryPeek() {
+  // Delegates to this._sabReader.tryPeek()
+}
+```
+
+- Worker side only. Throws if called from main side or in nonblocking mode.
+- Same semantics as `SABPipe.tryPeek()`
+
+#### `asyncRead(timeout, max_num_messages)` — worker, blocking mode only
+
+```javascript
+asyncRead(timeout, max_num_messages) {
+  // Delegates to this._sabReader.asyncRead(...)
+}
+```
+
+- Worker side only. Throws if called from main side or in nonblocking mode.
+- Same semantics as `SABPipe.asyncRead()`
+
+### Mode Switching: `setMode(mode)`
+
+```javascript
+setMode(mode)  // mode: 'blocking' | 'nonblocking'
+```
+
+Switches the channel's operating mode. No-op if already in the requested mode.
+
+**Main side:**
+- Simply updates `this._mode`, which controls whether `postMessage()` uses SABPipe or native MessagePort.
+
+**Worker side — switching to nonblocking:**
+1. Drains all remaining messages from the SABPipe read queue via `tryRead()` into `_pendingDrain`
+2. Sets mode to `'nonblocking'`
+3. When `onmessage` is subsequently set, pending drain messages are delivered first (FIFO), then the native port handler is attached
+
+**Worker side — switching to blocking:**
+1. Detaches `onmessage` handler from native port (sets to `null`)
+2. Sets mode to `'blocking'`
+
+**Important:** The drain mechanism ensures no messages are lost during the transition from SABPipe-based reads to MessagePort-based `onmessage` delivery.
+
+### Lifecycle
+
+```javascript
+close() {
+  // Main: destroys SABPipe writer, closes native port
+  // Worker: destroys SABPipe reader, closes native port
+}
+
+get buffer() {
+  return this._sab;
+}
+```
+
+- `close()` destroys the SABPipe endpoint and closes the native MessagePort
+- `buffer` returns the underlying SharedArrayBuffer
+
+### Full Usage Example
+
+```javascript
+// === Main thread ===
+import { MWChannel } from './SABMessagePort.js';
+
+const ch = new MWChannel('m');
+ch.postInit(worker, { channel: 'events' });
+
+// Receive from worker (always via native MessagePort)
+ch.onmessage = (e) => {
+  console.log('worker says:', e.data);
+};
+
+// Send to worker (via SABPipe in blocking mode)
+ch.postMessage({ cmd: 'start' });
+
+// === Worker ===
+import { MWChannel } from './SABMessagePort.js';
+
+self.onmessage = (e) => {
+  if (e.data.type === 'MWChannel') {
+    const ch = MWChannel.from(e.data);
+
+    // Blocking mode (default) — synchronous reads
+    const msg = ch.read(5000);      // blocks up to 5s
+    ch.postMessage({ reply: 'got it' });
+
+    // Peek without consuming
+    const next = ch.tryPeek();      // null if nothing pending
+
+    // Switch to async event-driven mode
+    ch.setMode('nonblocking');
+    ch.onmessage = (e) => {
+      console.log('from main:', e.data);
     };
   }
 };
