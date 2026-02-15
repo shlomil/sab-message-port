@@ -1483,6 +1483,102 @@
       }
 
       // ─────────────────────────────────────────────────────────────
+      group('tryPeek');
+      // ─────────────────────────────────────────────────────────────
+
+      // tryPeek on empty pipe
+      {
+        const peekW1 = createWorker();
+        await waitForWorkerReady(peekW1);
+        const peekSab1 = new SharedArrayBuffer(131072);
+        const peekResult1 = await runWorkerTest(peekW1, 'test_peek_empty', peekSab1, { testTimeout: 3000 });
+        test('tryPeek: returns null when empty', peekResult1.peeked === null);
+        peekW1.terminate();
+      }
+
+      // tryPeek returns message without consuming
+      {
+        const peekW2 = createWorker();
+        await waitForWorkerReady(peekW2);
+        const peekSab2 = new SharedArrayBuffer(131072);
+        const writer2 = new SABPipe('w', peekSab2);
+        const peekPromise2 = runWorkerTest(peekW2, 'test_peek_available', peekSab2, { testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        writer2.postMessage({ marker: true });
+        await writer2.postMessage({ hello: 'peek' });
+        const peekResult2 = await peekPromise2;
+        assertEqual('tryPeek: peeked message', peekResult2.peeked?.hello, 'peek');
+        assertEqual('tryPeek: read same message', peekResult2.read?.hello, 'peek');
+        test('tryPeek: null after consumed', peekResult2.peekAfter === null);
+        peekW2.terminate();
+      }
+
+      // tryPeek repeated returns same message
+      {
+        const peekW3 = createWorker();
+        await waitForWorkerReady(peekW3);
+        const peekSab3 = new SharedArrayBuffer(131072);
+        const writer3 = new SABPipe('w', peekSab3);
+        const peekPromise3 = runWorkerTest(peekW3, 'test_peek_repeated', peekSab3, { testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        writer3.postMessage({ marker: true });
+        await writer3.postMessage({ id: 42 });
+        const peekResult3 = await peekPromise3;
+        assertEqual('tryPeek: first peek', peekResult3.peek1?.id, 42);
+        assertEqual('tryPeek: second peek same', peekResult3.peek2?.id, 42);
+        assertEqual('tryPeek: read consumes', peekResult3.read?.id, 42);
+        test('tryPeek: null after read', peekResult3.peek3 === null);
+        peekW3.terminate();
+      }
+
+      // tryPeek on SABMessagePort
+      {
+        const peekW4 = createWorker();
+        await waitForWorkerReady(peekW4);
+        const peekSab4 = new SharedArrayBuffer(256 * 1024);
+        const peekPort4 = new SABMessagePort('a', peekSab4);
+        const peekPromise4 = runWorkerTest(peekW4, 'test_peek_bidi', peekSab4, { testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        peekPort4.postMessage({ marker: true });
+        await peekPort4.postMessage({ bidi: 'peek-test' });
+        const peekResult4 = await peekPromise4;
+        assertEqual('tryPeek bidi: peeked', peekResult4.peeked?.bidi, 'peek-test');
+        assertEqual('tryPeek bidi: read same', peekResult4.read?.bidi, 'peek-test');
+        test('tryPeek bidi: null after', peekResult4.peekAfter === null);
+        peekW4.terminate();
+      }
+
+      // tryPeek on MWChannel
+      {
+        const peekMw = new MWChannel('m');
+        const [peekMwInit, peekMwTransfer] = peekMw.postInit(null);
+        const peekMwWorker = createWorker();
+        await waitForWorkerReady(peekMwWorker);
+
+        const peekMwResult = new Promise((resolve, reject) => {
+          const t = setTimeout(() => { peekMwWorker.terminate(); reject(new Error('Timeout')); }, 5000);
+          peekMwWorker.addEventListener('message', (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); resolve(e.data.result); }
+            else if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          });
+        });
+
+        peekMwWorker.postMessage(
+          { test: 'test_mw_peek', mwInit: peekMwInit, options: {} },
+          peekMwTransfer
+        );
+        await new Promise(r => setTimeout(r, 50));
+        peekMw.postMessage({ marker: true });
+        await peekMw.postMessage({ mw: 'peek-mw' });
+        const peekMwR = await peekMwResult;
+        peekMwWorker.terminate();
+
+        assertEqual('tryPeek mw: peeked', peekMwR.peeked?.mw, 'peek-mw');
+        assertEqual('tryPeek mw: read same', peekMwR.read?.mw, 'peek-mw');
+        test('tryPeek mw: null after', peekMwR.peekAfter === null);
+      }
+
+      // ─────────────────────────────────────────────────────────────
       group('Round-Trip Comparison');
       // ─────────────────────────────────────────────────────────────
 

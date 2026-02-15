@@ -638,6 +638,21 @@ export class SABPipe {
   }
 
   /**
+   * Non-blocking peek - returns the next message without removing it from the queue.
+   * If the queue is empty, attempts a non-blocking read from the SAB first.
+   * @returns {*|null} - The next message, or null if no data available
+   */
+  tryPeek() {
+    if (!this.isReader) throw new Error('Only reader can peek');
+    if (this._onmessage !== null) throw new Error('Cannot call tryPeek while onmessage is active');
+    this._checkDisposed();
+    if (this._read_queue.length === 0) {
+      this._read(false, 0);
+    }
+    return this._read_queue.length > 0 ? this._read_queue[this._read_queue.length - 1] : null;
+  }
+
+  /**
    * Async read message(s) from the channel. Main-thread safe.
    * @param {number} timeout - Timeout in ms
    * @param {number} max_num_messages - Maximum messages to return
@@ -791,6 +806,10 @@ export class SABMessagePort {
     return this._reader.tryRead(max_num_messages);
   }
 
+  tryPeek() {
+    return this._reader.tryPeek();
+  }
+
   close() {
     this._writer.destroy();
     this._reader.destroy();
@@ -927,6 +946,15 @@ export class MWChannel {
     if (this._side !== 'w') throw new Error('tryRead() is only for worker side');
     if (this._mode !== 'blocking') throw new Error('tryRead() only available in blocking mode');
     return this._sabReader.tryRead(max_num_messages);
+  }
+
+  /**
+   * Non-blocking peek from SABPipe. Worker side, blocking mode only.
+   */
+  tryPeek() {
+    if (this._side !== 'w') throw new Error('tryPeek() is only for worker side');
+    if (this._mode !== 'blocking') throw new Error('tryPeek() only available in blocking mode');
+    return this._sabReader.tryPeek();
   }
 
   /**

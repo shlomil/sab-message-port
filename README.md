@@ -285,6 +285,10 @@ const msg = port.tryRead();       // single message or null
 const msgs = port.tryRead(10);    // up to 10 messages (array, newest first) or []
 ```
 
+### `port.tryPeek()` → message | null
+
+Non-blocking peek. Returns the next message without removing it from the queue. If the queue is empty, attempts a non-blocking read from the shared buffer first. Returns `null` if no data is available.
+
 ### `port.close()`
 
 Disposes both directions. Unblocks any waiting readers/writers by signaling disposal. After closing, all `postMessage()`, `read()`, `asyncRead()`, and `tryRead()` calls will throw. Calling `close()` multiple times is safe (subsequent calls are no-ops).
@@ -361,6 +365,15 @@ Async read using `Atomics.waitAsync`. **Safe on the main thread.**
 #### `reader.tryRead(maxMessages = 1)`
 
 Non-blocking read. Equivalent to `reader.read(0, false, maxMessages)`. Returns immediately.
+
+#### `reader.tryPeek()` → message | null
+
+Non-blocking peek. Returns the next message that would be returned by `read()` or `tryRead()`, **without removing it from the queue**. If the internal queue is empty, attempts a non-blocking read from the shared buffer first. Returns `null` if no data is available.
+
+```javascript
+const msg = reader.tryPeek();   // peek at next message, or null
+const same = reader.tryRead();  // consumes the same message
+```
 
 #### `reader.onmessage`
 
@@ -454,6 +467,10 @@ worker.postMessage(msg, transfer);
 ### `port.tryRead(maxMessages = 1)`
 
 **Worker side, blocking mode only.** Non-blocking read from the SABPipe. Throws if called on main side or in nonblocking mode.
+
+### `port.tryPeek()`
+
+**Worker side, blocking mode only.** Non-blocking peek from the SABPipe. Returns the next message without removing it, or `null`. Throws if called on main side or in nonblocking mode.
 
 ### `port.asyncRead(timeout = Infinity, maxMessages = 1)`
 

@@ -413,6 +413,49 @@ if (!isMainThread) {
         await port.postMessage(msg);
       }
       return { count: iterations };
+    },
+
+    // --- tryPeek handlers ---
+
+    test_peek_empty(sab) {
+      const reader = new SABPipe('r', sab);
+      const peeked = reader.tryPeek();
+      return { peeked };
+    },
+
+    test_peek_available(sab) {
+      const reader = new SABPipe('r', sab);
+      // Block until batch arrives (consumes first message, leaves second in queue)
+      const marker = reader.read(2000);
+      // Peek at second message without consuming
+      const peeked = reader.tryPeek();
+      // Read should return the same message (now consumed)
+      const read = reader.tryRead();
+      // Next peek should be null
+      const peekAfter = reader.tryPeek();
+      return { marker, peeked, read, peekAfter };
+    },
+
+    test_peek_repeated(sab) {
+      const reader = new SABPipe('r', sab);
+      // Block until batch arrives (consumes first message)
+      reader.read(2000);
+      const peek1 = reader.tryPeek();
+      const peek2 = reader.tryPeek();
+      const read = reader.tryRead();
+      const peek3 = reader.tryPeek();
+      return { peek1, peek2, read, peek3 };
+    },
+
+    test_peek_bidi(sab) {
+      const port = new SABMessagePort('b', sab);
+      parentPort.postMessage({ status: 'blocking' });
+      // Block until batch arrives (consumes first message)
+      port.read(2000);
+      const peeked = port.tryPeek();
+      const read = port.tryRead();
+      const peekAfter = port.tryPeek();
+      return { peeked, read, peekAfter };
     }
   };
 
@@ -584,6 +627,22 @@ if (!isMainThread) {
           port.postMessage(m);
         }
         parentPort.postMessage({ result: { count: iterations } });
+      } catch (err) {
+        parentPort.postMessage({ error: err.message });
+      }
+      setTimeout(() => process.exit(0), 100);
+      return;
+    }
+
+    if (testName === 'test_mw_peek') {
+      try {
+        const port = MWChannel.from(msg.mwInit);
+        // Block until batch arrives (consumes marker, leaves data in queue)
+        port.read(2000);
+        const peeked = port.tryPeek();
+        const read = port.tryRead();
+        const peekAfter = port.tryPeek();
+        parentPort.postMessage({ result: { peeked, read, peekAfter } });
       } catch (err) {
         parentPort.postMessage({ error: err.message });
       }
@@ -1994,6 +2053,95 @@ async function runTests() {
     let mwWriteAfterClose = null;
     try { await mw.postMessage({ test: 1 }); } catch (e) { mwWriteAfterClose = e; }
     test('mw close: postMessage throws', mwWriteAfterClose !== null);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('tryPeek');
+  // ─────────────────────────────────────────────────────────────
+
+  // tryPeek on empty pipe
+  {
+    const t1 = runWorkerTest('test_peek_empty', new SharedArrayBuffer(131072), { testTimeout: 3000 });
+    await t1.ready();
+    const peekResult = await t1.result;
+    test('tryPeek: returns null when empty', peekResult.peeked === null);
+  }
+
+  // tryPeek returns message without consuming (batch: marker + data)
+  {
+    const peekSab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', peekSab);
+    const t2 = runWorkerTest('test_peek_available', peekSab, { testTimeout: 5000 });
+    await t2.ready();
+    await new Promise(r => setTimeout(r, 50));
+    // Send two messages as a batch (no await between)
+    writer.postMessage({ marker: true });
+    await writer.postMessage({ hello: 'peek' });
+    const peekResult = await t2.result;
+    assertEqual('tryPeek: peeked message', peekResult.peeked?.hello, 'peek');
+    assertEqual('tryPeek: read same message', peekResult.read?.hello, 'peek');
+    test('tryPeek: null after consumed', peekResult.peekAfter === null);
+  }
+
+  // tryPeek repeated returns same message (batch: marker + data)
+  {
+    const peekSab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', peekSab);
+    const t3 = runWorkerTest('test_peek_repeated', peekSab, { testTimeout: 5000 });
+    await t3.ready();
+    await new Promise(r => setTimeout(r, 50));
+    writer.postMessage({ marker: true });
+    await writer.postMessage({ id: 42 });
+    const peekResult = await t3.result;
+    assertEqual('tryPeek: first peek', peekResult.peek1?.id, 42);
+    assertEqual('tryPeek: second peek same', peekResult.peek2?.id, 42);
+    assertEqual('tryPeek: read consumes', peekResult.read?.id, 42);
+    test('tryPeek: null after read', peekResult.peek3 === null);
+  }
+
+  // tryPeek on SABMessagePort (batch: marker + data)
+  {
+    const peekSab = new SharedArrayBuffer(256 * 1024);
+    const peekPort = new SABMessagePort('a', peekSab);
+    const t4 = runWorkerTest('test_peek_bidi', peekSab, {
+      waitForBlocking: true, testTimeout: 5000
+    });
+    await t4.ready();
+    peekPort.postMessage({ marker: true });
+    await peekPort.postMessage({ bidi: 'peek-test' });
+    const peekResult = await t4.result;
+    assertEqual('tryPeek bidi: peeked', peekResult.peeked?.bidi, 'peek-test');
+    assertEqual('tryPeek bidi: read same', peekResult.read?.bidi, 'peek-test');
+    test('tryPeek bidi: null after', peekResult.peekAfter === null);
+  }
+
+  // tryPeek on MWChannel
+  {
+    const mw = new MWChannel('m');
+    const [initMsg, transfer] = mw.postInit(null);
+    const w = new Worker(__filename);
+
+    let readyResolve, resultResolve, resultReject;
+    const readyPromise = new Promise(r => { readyResolve = r; });
+    const resultPromise = new Promise((r, j) => { resultResolve = r; resultReject = j; });
+    const t = setTimeout(() => { w.terminate(); resultReject(new Error('Timeout')); }, 5000);
+    w.on('message', msg => {
+      if (msg.status === 'ready') readyResolve();
+      else if (msg.result !== undefined) { clearTimeout(t); resultResolve(msg.result); }
+      else if (msg.error) { clearTimeout(t); resultReject(new Error(msg.error)); }
+    });
+
+    await readyPromise;
+    w.postMessage({ test: 'test_mw_peek', mwInit: initMsg, options: {} }, transfer);
+    await new Promise(r => setTimeout(r, 50));
+    mw.postMessage({ marker: true });
+    await mw.postMessage({ mw: 'peek-mw' });
+    const mwPeekResult = await resultPromise;
+    w.terminate();
+
+    assertEqual('tryPeek mw: peeked', mwPeekResult.peeked?.mw, 'peek-mw');
+    assertEqual('tryPeek mw: read same', mwPeekResult.read?.mw, 'peek-mw');
+    test('tryPeek mw: null after', mwPeekResult.peekAfter === null);
   }
 
   // ─────────────────────────────────────────────────────────────

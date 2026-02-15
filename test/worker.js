@@ -326,6 +326,45 @@ const handlers = {
       await port.postMessage(msg);
     }
     self.postMessage({ result: { count: iterations } });
+  },
+
+  // --- tryPeek handlers ---
+
+  test_peek_empty(sab) {
+    const reader = new SABPipe('r', sab);
+    const peeked = reader.tryPeek();
+    self.postMessage({ result: { peeked } });
+  },
+
+  test_peek_available(sab) {
+    const reader = new SABPipe('r', sab);
+    // Block until batch arrives (consumes marker, leaves data in queue)
+    reader.read(2000);
+    const peeked = reader.tryPeek();
+    const read = reader.tryRead();
+    const peekAfter = reader.tryPeek();
+    self.postMessage({ result: { peeked, read, peekAfter } });
+  },
+
+  test_peek_repeated(sab) {
+    const reader = new SABPipe('r', sab);
+    // Block until batch arrives (consumes marker)
+    reader.read(2000);
+    const peek1 = reader.tryPeek();
+    const peek2 = reader.tryPeek();
+    const read = reader.tryRead();
+    const peek3 = reader.tryPeek();
+    self.postMessage({ result: { peek1, peek2, read, peek3 } });
+  },
+
+  test_peek_bidi(sab) {
+    const port = new SABMessagePort('b', sab);
+    // Block until batch arrives (consumes marker)
+    port.read(2000);
+    const peeked = port.tryPeek();
+    const read = port.tryRead();
+    const peekAfter = port.tryPeek();
+    self.postMessage({ result: { peeked, read, peekAfter } });
   }
 };
 
@@ -410,6 +449,21 @@ self.onmessage = async (e) => {
         port.postMessage(m);
       }
       self.postMessage({ result: { count: iterations } });
+    } catch (err) {
+      self.postMessage({ status: 'error', error: err.message });
+    }
+    return;
+  }
+
+  if (test === 'test_mw_peek') {
+    try {
+      const port = MWChannel.from(e.data.mwInit);
+      // Block until batch arrives (consumes marker)
+      port.read(2000);
+      const peeked = port.tryPeek();
+      const read = port.tryRead();
+      const peekAfter = port.tryPeek();
+      self.postMessage({ result: { peeked, read, peekAfter } });
     } catch (err) {
       self.postMessage({ status: 'error', error: err.message });
     }
