@@ -456,6 +456,57 @@ if (!isMainThread) {
       const read = port.tryRead();
       const peekAfter = port.tryPeek();
       return { peeked, read, peekAfter };
+    },
+
+    // --- queueLimit handlers ---
+
+    test_qlimit_read(sab, options) {
+      const limit = options.queueLimit ?? null;
+      const reader = new SABPipe('r', sab, 0, null, limit);
+      parentPort.postMessage({ status: 'blocking' });
+      // Wait for batch via blocking read (returns first message)
+      const first = reader.read(3000);
+      if (first === null) return { ids: [], count: 0 };
+      const all = [first];
+      let msg;
+      while ((msg = reader.tryRead()) !== null) {
+        all.push(msg);
+      }
+      return { ids: all.map(m => m.id), count: all.length };
+    },
+
+    test_overflow_cb_read(sab, options) {
+      const limit = options.queueLimit ?? null;
+      const reader = new SABPipe('r', sab, 0, null, limit);
+      let cbQueue = null;
+      reader.onQueueOverflow = (queue) => { cbQueue = [...queue]; };
+      parentPort.postMessage({ status: 'blocking' });
+      const first = reader.read(3000);
+      if (first === null) return { cbQueue: null, ids: [], count: 0 };
+      const all = [first];
+      let msg;
+      while ((msg = reader.tryRead()) !== null) {
+        all.push(msg);
+      }
+      return { cbQueue, ids: all.map(m => m.id), count: all.length };
+    },
+
+    test_overflow_cb_prevent(sab, options) {
+      const limit = options.queueLimit ?? null;
+      const reader = new SABPipe('r', sab, 0, null, limit);
+      reader.onQueueOverflow = (queue) => {
+        // Manually trim to exactly queueLimit — prevent auto-truncation
+        while (queue.length > limit) queue.pop();
+      };
+      parentPort.postMessage({ status: 'blocking' });
+      const first = reader.read(3000);
+      if (first === null) return { ids: [], count: 0 };
+      const all = [first];
+      let msg;
+      while ((msg = reader.tryRead()) !== null) {
+        all.push(msg);
+      }
+      return { ids: all.map(m => m.id), count: all.length };
     }
   };
 
@@ -2142,6 +2193,199 @@ async function runTests() {
     assertEqual('tryPeek mw: peeked', mwPeekResult.peeked?.mw, 'peek-mw');
     assertEqual('tryPeek mw: read same', mwPeekResult.read?.mw, 'peek-mw');
     test('tryPeek mw: null after', mwPeekResult.peekAfter === null);
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  group('queueLimit');
+  // ─────────────────────────────────────────────────────────────
+
+  // Constructor defaults
+  {
+    const w = new SABPipe('w', 131072);
+    test('SABPipe queueLimit default null', w.queueLimit === null);
+    w.destroy();
+  }
+  {
+    const w = new SABPipe('w', 131072, 0, null, 5);
+    test('SABPipe queueLimit via constructor', w.queueLimit === 5);
+    w.destroy();
+  }
+
+  // SABMessagePort delegation
+  {
+    const port = new SABMessagePort('a', 256, 3);
+    test('SABMessagePort queueLimit via constructor', port.queueLimit === 3);
+    port.queueLimit = 7;
+    test('SABMessagePort queueLimit setter', port.queueLimit === 7);
+    port.queueLimit = null;
+    test('SABMessagePort queueLimit reset to null', port.queueLimit === null);
+    port.close();
+  }
+
+  // MWChannel delegation
+  {
+    const mw = new MWChannel('m', 128, 10);
+    test('MWChannel queueLimit via constructor', mw.queueLimit === 10);
+    mw.queueLimit = 2;
+    test('MWChannel queueLimit setter', mw.queueLimit === 2);
+    mw.close();
+  }
+
+  // Validation
+  {
+    let threw = false;
+    try { const w = new SABPipe('w', 131072); w.queueLimit = -1; } catch (e) { threw = true; }
+    test('queueLimit rejects negative', threw);
+  }
+  {
+    let threw = false;
+    try { const w = new SABPipe('w', 131072); w.queueLimit = 1.5; } catch (e) { threw = true; }
+    test('queueLimit rejects non-integer', threw);
+  }
+  {
+    let threw = false;
+    try { const w = new SABPipe('w', 131072); w.queueLimit = 0; } catch (e) { threw = true; }
+    test('queueLimit allows zero', !threw);
+  }
+
+  // Write queue limit: post 10 msgs with queueLimit=5, worker reads without limit
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab, 0, null, 5);
+    const t = runWorkerTest('test_qlimit_read', sab, { queueLimit: null, waitForBlocking: true, testTimeout: 5000 });
+    await t.ready();
+    for (let i = 0; i < 10; i++) {
+      writer.postMessage({ id: i });
+    }
+    const result = await t.result;
+    assertEqual('write queueLimit=5: count', result.count, 5);
+    assertEqual('write queueLimit=5: newest 5 sent', result.ids, [5, 6, 7, 8, 9]);
+    writer.destroy();
+  }
+
+  // Read queue limit: post 10 msgs without limit, worker reads with queueLimit=3
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab);
+    const t = runWorkerTest('test_qlimit_read', sab, { queueLimit: 3, waitForBlocking: true, testTimeout: 5000 });
+    await t.ready();
+    for (let i = 0; i < 10; i++) {
+      writer.postMessage({ id: i });
+    }
+    const result = await t.result;
+    assertEqual('read queueLimit=3: count', result.count, 3);
+    assertEqual('read queueLimit=3: newest 3 kept', result.ids, [7, 8, 9]);
+    writer.destroy();
+  }
+
+  // queueLimit=1: only last message survives
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab, 0, null, 1);
+    const t = runWorkerTest('test_qlimit_read', sab, { queueLimit: null, waitForBlocking: true, testTimeout: 5000 });
+    await t.ready();
+    for (let i = 0; i < 5; i++) {
+      writer.postMessage({ id: i });
+    }
+    const result = await t.result;
+    assertEqual('write queueLimit=1: count', result.count, 1);
+    assertEqual('write queueLimit=1: only last', result.ids, [4]);
+    writer.destroy();
+  }
+
+  // onQueueOverflow — callback fires on write overflow
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab, 0, null, 3);
+    let callCount = 0;
+    let lastQueue = null;
+    writer.onQueueOverflow = (queue) => { callCount++; lastQueue = [...queue]; };
+    for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+    test('onQueueOverflow write: callback fired', callCount > 0);
+    // Callback fires each time queue exceeds limit (on 4th and 5th push)
+    assertEqual('onQueueOverflow write: call count', callCount, 2);
+    writer.destroy();
+  }
+
+  // onQueueOverflow — callback fires on read overflow (worker side)
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab);
+    const t = runWorkerTest('test_overflow_cb_read', sab, { queueLimit: 3, waitForBlocking: true, testTimeout: 5000 });
+    await t.ready();
+    for (let i = 0; i < 10; i++) {
+      writer.postMessage({ id: i });
+    }
+    await new Promise(r => setTimeout(r, 100));
+    writer.destroy();
+    const result = await t.result;
+    test('onQueueOverflow read: callback fired', result.cbQueue !== null);
+    test('onQueueOverflow read: cb got overflowing queue', result.cbQueue.length > 3);
+    assertEqual('onQueueOverflow read: count after truncation', result.count, 3);
+  }
+
+  // onQueueOverflow — callback can prevent truncation
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab, 0, null, 3);
+    let prevented = false;
+    writer.onQueueOverflow = (queue) => {
+      // Manually trim to exactly queueLimit
+      while (queue.length > 3) queue.shift();
+      prevented = true;
+    };
+    for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+    test('onQueueOverflow prevent: callback handled it', prevented);
+    // Writer queue should have exactly 3 — the ones callback kept (2,3,4)
+    writer.destroy();
+  }
+
+  // onQueueOverflow — read-side callback can prevent truncation
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab);
+    const t = runWorkerTest('test_overflow_cb_prevent', sab, { queueLimit: 3, waitForBlocking: true, testTimeout: 5000 });
+    await t.ready();
+    for (let i = 0; i < 10; i++) {
+      writer.postMessage({ id: i });
+    }
+    await new Promise(r => setTimeout(r, 100));
+    writer.destroy();
+    const result = await t.result;
+    assertEqual('onQueueOverflow prevent read: count', result.count, 3);
+  }
+
+  // onQueueOverflow — no callback = silent truncation (existing behavior)
+  {
+    const sab = new SharedArrayBuffer(131072);
+    const writer = new SABPipe('w', sab, 0, null, 3);
+    test('onQueueOverflow default null', writer.onQueueOverflow === null);
+    for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+    // No error thrown — silent truncation
+    test('onQueueOverflow null: no error', true);
+    writer.destroy();
+  }
+
+  // onQueueOverflow — SABMessagePort delegation
+  {
+    const port = new SABMessagePort('a', 256, 5);
+    const handler = (q) => {};
+    port.onQueueOverflow = handler;
+    test('onQueueOverflow SABMessagePort: getter', port.onQueueOverflow === handler);
+    port.onQueueOverflow = null;
+    test('onQueueOverflow SABMessagePort: reset', port.onQueueOverflow === null);
+    port.close();
+  }
+
+  // onQueueOverflow — MWChannel delegation
+  {
+    const mw = new MWChannel('m', 128, 5);
+    const handler = (q) => {};
+    mw.onQueueOverflow = handler;
+    test('onQueueOverflow MWChannel: getter', mw.onQueueOverflow === handler);
+    mw.onQueueOverflow = null;
+    test('onQueueOverflow MWChannel: reset', mw.onQueueOverflow === null);
+    mw.close();
   }
 
   // ─────────────────────────────────────────────────────────────

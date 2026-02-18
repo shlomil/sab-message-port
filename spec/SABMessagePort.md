@@ -445,6 +445,67 @@ isDisposed() {
 - Returns `true` if the pipe has been destroyed locally or disposed by the other side
 - Does **not** throw — safe to call at any time as a status check
 
+### Queue Limit (`queueLimit`)
+
+Optional per-pipe message count limit. When the queue exceeds the limit, the **oldest** messages are silently discarded. Feature is off by default (`null`).
+
+```javascript
+get queueLimit() { return this._queueLimit; }
+
+set queueLimit(value) {
+  // Validates: null or non-negative integer
+  // If lowering limit: immediately trims existing queue contents
+  this._queueLimit = value;
+}
+```
+
+**Getter/Setter:**
+- `null` = no limit (default, feature off)
+- Non-negative integer = enforced
+- Negative, non-integer, or non-null/non-number → throws `Error('queueLimit must be null or a non-negative integer')`
+- `0` is allowed (every message is immediately discarded — "black hole")
+
+**Setter immediate enforcement:**
+When the limit is lowered at runtime, the setter immediately trims the current queue:
+- Writer: trims `_write_queue.queue` (oldest at index 0 → `splice(0, excess)`)
+- Reader: trims `_read_queue` (oldest at end → `this._read_queue.length = value`)
+
+**Enforcement points:**
+
+1. **Write queue — `postMessage()`**: After `_write_queue.queue.push(jsonMessage)`, if limit exceeded, `splice(0, excess)` discards oldest from front. `_payload_in_progress` is never trimmed (already being serialized to SAB wire).
+
+2. **Read queue — `_read()` and `_asyncRead()`**: After populating `_read_queue` via `messages.concat(this._read_queue)`, calls `_enforceQueueLimit()` which truncates the tail (oldest messages).
+
+**Internal helper:**
+
+```javascript
+_enforceQueueLimit() {
+  if (this._queueLimit !== null && this._read_queue.length > this._queueLimit) {
+    if (this._onQueueOverflow) this._onQueueOverflow(this._read_queue);
+    if (this._read_queue.length > this._queueLimit) {
+      this._read_queue.length = this._queueLimit;
+    }
+  }
+}
+```
+
+### `onQueueOverflow` (getter/setter)
+
+Callback invoked **before** a queue is truncated due to exceeding its `queueLimit`. The callback receives the overflowing queue array by reference — the user can inspect, log, or modify it. After the callback returns, the queue is truncated only if it still exceeds the limit.
+
+```javascript
+get onQueueOverflow() { return this._onQueueOverflow; }
+
+set onQueueOverflow(handler) {
+  this._onQueueOverflow = handler ?? null;
+}
+```
+
+- **`null`** (default): No callback — overflow is silently truncated.
+- **`function(queue)`**: Called at every enforcement point before truncation.
+- The callback receives the actual queue array (by reference). Modifying it (e.g., splicing to exactly `queueLimit`) prevents automatic truncation.
+- Fires at all enforcement points: `postMessage()` write queue, `_enforceQueueLimit()` read queue, and `queueLimit` setter immediate enforcement.
+
 ### `close()` / `destroy()`
 
 ```javascript
@@ -546,7 +607,7 @@ if (this._onmessage !== null) {
 ## Constructor
 
 ```javascript
-constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null) {
+constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null, queueLimit = null) {
   this._sab = (typeof sabOrSize === 'number')
     ? new SharedArrayBuffer(sabOrSize)
     : sabOrSize;
@@ -556,6 +617,7 @@ constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null) {
   this.i32 = new Int32Array(this._sab, byteOffset, size >> 2);
   this.u8 = new Uint8Array(this._sab, byteOffset, size);
   this.maxChunk = size - DATA_OFFSET;
+  this._queueLimit = queueLimit;
 
   if (role === 'w') {
     this.isWriter = true;
@@ -581,6 +643,7 @@ constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null) {
 - `sabOrSize` (optional): Existing SharedArrayBuffer or byte size (default: 128 KB)
 - `byteOffset` (optional): Starting byte position in the SAB (default: 0). Must be 4-byte aligned.
 - `sectionSize` (optional): Size of this section in bytes (default: remaining SAB from offset)
+- `queueLimit` (optional): Maximum number of queued messages (`null` = unlimited, default). When exceeded, oldest messages are silently discarded. See [Queue Limit](#queue-limit-queuelimit).
 
 All existing code uses the typed array views (`i32`, `u8`), never the raw SAB, so offset support requires no changes beyond the constructor.
 
@@ -625,7 +688,7 @@ SharedArrayBuffer (256 KB total)
 ### Constructor
 
 ```javascript
-constructor(side = 'a', sabOrSizeKB = 256)
+constructor(side = 'a', sabOrSizeKB = 256, queueLimit = null)
 ```
 
 **Parameters:**
@@ -633,6 +696,7 @@ constructor(side = 'a', sabOrSizeKB = 256)
   Typically the initiator uses the default and the responder is created via `SABMessagePort.from()`, so this parameter rarely needs to be specified explicitly.
 - `sabOrSizeKB` (optional): Total size in KB (number) or existing SharedArrayBuffer.
   Default: `256` (256 KB total, each section 128 KB — matches SABPipe's default)
+- `queueLimit` (optional): Maximum number of queued messages per direction (`null` = unlimited, default). Passed to both internal SABPipe instances.
 
 **Size handling:**
 - If number: treated as KB. Must be a power of 2 (64, 128, 256, 512, ...). Creates a new SAB of `sabOrSizeKB * 1024` bytes.
@@ -642,7 +706,7 @@ constructor(side = 'a', sabOrSizeKB = 256)
 **Internal construction:**
 
 ```javascript
-constructor(side = 'a', sabOrSizeKB = 256) {
+constructor(side = 'a', sabOrSizeKB = 256, queueLimit = null) {
   if (side !== 'a' && side !== 'b') throw new Error("side must be 'a' or 'b'");
 
   this._sab = (typeof sabOrSizeKB === 'number')
@@ -652,11 +716,11 @@ constructor(side = 'a', sabOrSizeKB = 256) {
   const sectionSize = this._sab.byteLength / 2;
 
   if (side === 'a') {
-    this._writer = new SABPipe('w', this._sab, 0, sectionSize);
-    this._reader = new SABPipe('r', this._sab, sectionSize, sectionSize);
+    this._writer = new SABPipe('w', this._sab, 0, sectionSize, queueLimit);
+    this._reader = new SABPipe('r', this._sab, sectionSize, sectionSize, queueLimit);
   } else {
-    this._reader = new SABPipe('r', this._sab, 0, sectionSize);
-    this._writer = new SABPipe('w', this._sab, sectionSize, sectionSize);
+    this._reader = new SABPipe('r', this._sab, 0, sectionSize, queueLimit);
+    this._writer = new SABPipe('w', this._sab, sectionSize, sectionSize, queueLimit);
   }
 }
 ```
@@ -699,16 +763,16 @@ port.onmessage = (e) => console.log('from worker:', e.data);
 port.postMessage({ hello: 'world' });
 ```
 
-### Factory: `SABMessagePort.from(initMsg)`
+### Factory: `SABMessagePort.from(initMsg, queueLimit = null)`
 
 Static factory that creates the responder side from a received init message.
 
 ```javascript
-static from(initMsg) {
+static from(initMsg, queueLimit = null) {
   if (initMsg?.type !== 'SABMessagePort') {
     throw new Error('Not a SABMessagePort init message');
   }
-  return new SABMessagePort('b', initMsg.buffer);
+  return new SABMessagePort('b', initMsg.buffer, queueLimit);
 }
 ```
 
@@ -760,6 +824,33 @@ tryPeek() {
   return this._reader.tryPeek();
 }
 ```
+
+**Queue limit (delegates to both pipes):**
+
+```javascript
+get queueLimit() { return this._writer.queueLimit; }
+
+set queueLimit(value) {
+  this._writer.queueLimit = value;
+  this._reader.queueLimit = value;
+}
+```
+
+- Setting `queueLimit` on the port propagates to both internal SABPipe instances
+- Reading returns the writer's value (both are always in sync)
+
+**Overflow callback (delegates to both pipes):**
+
+```javascript
+get onQueueOverflow() { return this._writer.onQueueOverflow; }
+
+set onQueueOverflow(handler) {
+  this._writer.onQueueOverflow = handler;
+  this._reader.onQueueOverflow = handler;
+}
+```
+
+- Propagates to both internal SABPipe instances
 
 **Lifecycle:**
 
@@ -838,21 +929,23 @@ Main thread                          Worker thread
 ### Constructor
 
 ```javascript
-constructor(side, sabSizeKB = 128)
+constructor(side, sabSizeKB = 128, queueLimit = null)
 ```
 
 **Parameters:**
 - `side` (required): `'m'` (main thread) or `'w'` (worker thread)
 - `sabSizeKB` (optional): SABPipe buffer size in KB (default: 128). Only used on the main side (creates the SharedArrayBuffer).
+- `queueLimit` (optional): Maximum number of queued messages (`null` = unlimited, default). Passed to the internal SABPipe and also enforced on `_pendingDrain`.
 
 **Internal construction (main side):**
 
 ```javascript
-constructor('m', sabSizeKB = 128) {
+constructor('m', sabSizeKB = 128, queueLimit = null) {
   this._sab = new SharedArrayBuffer(sabSizeKB * 1024);
   this._channel = new MessageChannel();
   this._nativePort = this._channel.port1;
-  this._sabWriter = new SABPipe('w', this._sab);
+  this._sabWriter = new SABPipe('w', this._sab, 0, null, queueLimit);
+  this._queueLimit = queueLimit;
   this._mode = 'blocking';       // default mode
   this._onmessage = null;
   this._pendingDrain = [];
@@ -861,19 +954,20 @@ constructor('m', sabSizeKB = 128) {
 
 The worker side is not constructed directly — it is created via `MWChannel.from()`.
 
-### Factory: `MWChannel.from(initMsg)`
+### Factory: `MWChannel.from(initMsg, queueLimit = null)`
 
 Static factory that creates the worker side from a received init message.
 
 ```javascript
-static from(initMsg) {
+static from(initMsg, queueLimit = null) {
   if (initMsg?.type !== 'MWChannel') {
     throw new Error('Not a MWChannel init message');
   }
   const mw = new MWChannel('w');
   mw._sab = initMsg.buffer;
   mw._nativePort = initMsg.port;
-  mw._sabReader = new SABPipe('r', mw._sab);
+  mw._queueLimit = queueLimit;
+  mw._sabReader = new SABPipe('r', mw._sab, 0, null, queueLimit);
   mw._nativePort.start();
   return mw;
 }
@@ -975,6 +1069,43 @@ asyncRead(timeout, max_num_messages) {
 - Worker side only. Throws if called from main side or in nonblocking mode.
 - Same semantics as `SABPipe.asyncRead()`
 
+#### `queueLimit` (getter/setter)
+
+```javascript
+get queueLimit() {
+  // Main: delegates to _sabWriter.queueLimit
+  // Worker: delegates to _sabReader.queueLimit
+}
+
+set queueLimit(value) {
+  // Delegates to the underlying SABPipe
+  // Also enforces on _pendingDrain (worker side):
+  if (this._queueLimit !== null && this._pendingDrain.length > this._queueLimit) {
+    this._pendingDrain.splice(0, this._pendingDrain.length - this._queueLimit);
+  }
+}
+```
+
+- Main side: delegates to `_sabWriter`
+- Worker side: delegates to `_sabReader`, and additionally trims `_pendingDrain` (oldest at front → `splice(0, excess)`)
+- `this._queueLimit` is stored locally for `_pendingDrain` enforcement
+
+#### `onQueueOverflow` (getter/setter)
+
+```javascript
+get onQueueOverflow() { return this._onQueueOverflow; }
+
+set onQueueOverflow(handler) {
+  this._onQueueOverflow = handler ?? null;
+  // Delegates to underlying SABPipe (_sabWriter on main, _sabReader on worker)
+  // Also stored locally for _pendingDrain enforcement
+}
+```
+
+- Main side: delegates to `_sabWriter.onQueueOverflow`
+- Worker side: delegates to `_sabReader.onQueueOverflow`
+- `this._onQueueOverflow` is stored locally for `_pendingDrain` overflow callbacks
+
 ### Mode Switching: `setMode(mode)`
 
 ```javascript
@@ -988,8 +1119,9 @@ Switches the channel's operating mode. No-op if already in the requested mode.
 
 **Worker side — switching to nonblocking:**
 1. Drains all remaining messages from the SABPipe read queue via `tryRead()` into `_pendingDrain`
-2. Sets mode to `'nonblocking'`
-3. When `onmessage` is subsequently set, pending drain messages are delivered first (FIFO), then the native port handler is attached
+2. If `queueLimit` is set, trims `_pendingDrain` to the limit (oldest at front → `splice(0, excess)`)
+3. Sets mode to `'nonblocking'`
+4. When `onmessage` is subsequently set, pending drain messages are delivered first (FIFO), then the native port handler is attached
 
 **Worker side — switching to blocking:**
 1. Detaches `onmessage` handler from native port (sets to `null`)

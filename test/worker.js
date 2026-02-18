@@ -365,6 +365,53 @@ const handlers = {
     const read = port.tryRead();
     const peekAfter = port.tryPeek();
     self.postMessage({ result: { peeked, read, peekAfter } });
+  },
+
+  // --- queueLimit handlers ---
+
+  test_qlimit_read(sab, options) {
+    const limit = options.queueLimit ?? null;
+    const reader = new SABPipe('r', sab, 0, null, limit);
+    // Wait for batch via blocking read (returns first message)
+    const first = reader.read(3000);
+    if (first === null) { self.postMessage({ result: { ids: [], count: 0 } }); return; }
+    const all = [first];
+    let msg;
+    while ((msg = reader.tryRead()) !== null) {
+      all.push(msg);
+    }
+    self.postMessage({ result: { ids: all.map(m => m.id), count: all.length } });
+  },
+
+  test_overflow_cb_read(sab, options) {
+    const limit = options.queueLimit ?? null;
+    const reader = new SABPipe('r', sab, 0, null, limit);
+    let cbQueue = null;
+    reader.onQueueOverflow = (queue) => { cbQueue = [...queue]; };
+    const first = reader.read(3000);
+    if (first === null) { self.postMessage({ result: { cbQueue: null, ids: [], count: 0 } }); return; }
+    const all = [first];
+    let msg;
+    while ((msg = reader.tryRead()) !== null) {
+      all.push(msg);
+    }
+    self.postMessage({ result: { cbQueue, ids: all.map(m => m.id), count: all.length } });
+  },
+
+  test_overflow_cb_prevent(sab, options) {
+    const limit = options.queueLimit ?? null;
+    const reader = new SABPipe('r', sab, 0, null, limit);
+    reader.onQueueOverflow = (queue) => {
+      while (queue.length > limit) queue.pop();
+    };
+    const first = reader.read(3000);
+    if (first === null) { self.postMessage({ result: { ids: [], count: 0 } }); return; }
+    const all = [first];
+    let msg;
+    while ((msg = reader.tryRead()) !== null) {
+      all.push(msg);
+    }
+    self.postMessage({ result: { ids: all.map(m => m.id), count: all.length } });
   }
 };
 

@@ -1579,6 +1579,209 @@
       }
 
       // ─────────────────────────────────────────────────────────────
+      group('queueLimit');
+      // ─────────────────────────────────────────────────────────────
+
+      // Constructor defaults
+      {
+        const w = new SABPipe('w', 131072);
+        test('SABPipe queueLimit default null', w.queueLimit === null);
+        w.destroy();
+      }
+      {
+        const w = new SABPipe('w', 131072, 0, null, 5);
+        test('SABPipe queueLimit via constructor', w.queueLimit === 5);
+        w.destroy();
+      }
+
+      // SABMessagePort delegation
+      {
+        const port = new SABMessagePort('a', 256, 3);
+        test('SABMessagePort queueLimit via constructor', port.queueLimit === 3);
+        port.queueLimit = 7;
+        test('SABMessagePort queueLimit setter', port.queueLimit === 7);
+        port.queueLimit = null;
+        test('SABMessagePort queueLimit reset to null', port.queueLimit === null);
+        port.close();
+      }
+
+      // MWChannel delegation
+      {
+        const mw = new MWChannel('m', 128, 10);
+        test('MWChannel queueLimit via constructor', mw.queueLimit === 10);
+        mw.queueLimit = 2;
+        test('MWChannel queueLimit setter', mw.queueLimit === 2);
+        mw.close();
+      }
+
+      // Validation
+      {
+        let threw = false;
+        try { const w = new SABPipe('w', 131072); w.queueLimit = -1; } catch (e) { threw = true; }
+        test('queueLimit rejects negative', threw);
+      }
+      {
+        let threw = false;
+        try { const w = new SABPipe('w', 131072); w.queueLimit = 1.5; } catch (e) { threw = true; }
+        test('queueLimit rejects non-integer', threw);
+      }
+      {
+        let threw = false;
+        try { const w = new SABPipe('w', 131072); w.queueLimit = 0; } catch (e) { threw = true; }
+        test('queueLimit allows zero', !threw);
+      }
+
+      // Write queue limit
+      {
+        const qlW1 = createWorker();
+        await waitForWorkerReady(qlW1);
+        const qlSab1 = new SharedArrayBuffer(131072);
+        const qlWriter1 = new SABPipe('w', qlSab1, 0, null, 5);
+        const qlPromise1 = runWorkerTest(qlW1, 'test_qlimit_read', qlSab1, { queueLimit: null, testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 10; i++) {
+          qlWriter1.postMessage({ id: i });
+        }
+        const qlResult1 = await qlPromise1;
+        assertEqual('write queueLimit=5: count', qlResult1.count, 5);
+        assertEqual('write queueLimit=5: newest 5 sent', qlResult1.ids, [5, 6, 7, 8, 9]);
+        qlWriter1.destroy();
+        qlW1.terminate();
+      }
+
+      // Read queue limit
+      {
+        const qlW2 = createWorker();
+        await waitForWorkerReady(qlW2);
+        const qlSab2 = new SharedArrayBuffer(131072);
+        const qlWriter2 = new SABPipe('w', qlSab2);
+        const qlPromise2 = runWorkerTest(qlW2, 'test_qlimit_read', qlSab2, { queueLimit: 3, testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 10; i++) {
+          qlWriter2.postMessage({ id: i });
+        }
+        const qlResult2 = await qlPromise2;
+        assertEqual('read queueLimit=3: count', qlResult2.count, 3);
+        assertEqual('read queueLimit=3: newest 3 kept', qlResult2.ids, [7, 8, 9]);
+        qlWriter2.destroy();
+        qlW2.terminate();
+      }
+
+      // queueLimit=1
+      {
+        const qlW3 = createWorker();
+        await waitForWorkerReady(qlW3);
+        const qlSab3 = new SharedArrayBuffer(131072);
+        const qlWriter3 = new SABPipe('w', qlSab3, 0, null, 1);
+        const qlPromise3 = runWorkerTest(qlW3, 'test_qlimit_read', qlSab3, { queueLimit: null, testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 5; i++) {
+          qlWriter3.postMessage({ id: i });
+        }
+        const qlResult3 = await qlPromise3;
+        assertEqual('write queueLimit=1: count', qlResult3.count, 1);
+        assertEqual('write queueLimit=1: only last', qlResult3.ids, [4]);
+        qlWriter3.destroy();
+        qlW3.terminate();
+      }
+
+      // onQueueOverflow — callback fires on write overflow
+      {
+        const sab = new SharedArrayBuffer(131072);
+        const writer = new SABPipe('w', sab, 0, null, 3);
+        let callCount = 0;
+        writer.onQueueOverflow = (queue) => { callCount++; };
+        for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+        test('onQueueOverflow write: callback fired', callCount > 0);
+        assertEqual('onQueueOverflow write: call count', callCount, 2);
+        writer.destroy();
+      }
+
+      // onQueueOverflow — callback fires on read overflow (worker side)
+      {
+        const oqW1 = createWorker();
+        await waitForWorkerReady(oqW1);
+        const oqSab1 = new SharedArrayBuffer(131072);
+        const oqWriter1 = new SABPipe('w', oqSab1);
+        const oqPromise1 = runWorkerTest(oqW1, 'test_overflow_cb_read', oqSab1, { queueLimit: 3, testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 10; i++) {
+          oqWriter1.postMessage({ id: i });
+        }
+        await new Promise(r => setTimeout(r, 100));
+        oqWriter1.destroy();
+        const oqResult1 = await oqPromise1;
+        test('onQueueOverflow read: callback fired', oqResult1.cbQueue !== null);
+        test('onQueueOverflow read: cb got overflowing queue', oqResult1.cbQueue.length > 3);
+        assertEqual('onQueueOverflow read: count after truncation', oqResult1.count, 3);
+        oqW1.terminate();
+      }
+
+      // onQueueOverflow — callback can prevent truncation (write side)
+      {
+        const sab = new SharedArrayBuffer(131072);
+        const writer = new SABPipe('w', sab, 0, null, 3);
+        let prevented = false;
+        writer.onQueueOverflow = (queue) => {
+          while (queue.length > 3) queue.shift();
+          prevented = true;
+        };
+        for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+        test('onQueueOverflow prevent: callback handled it', prevented);
+        writer.destroy();
+      }
+
+      // onQueueOverflow — read-side callback can prevent truncation
+      {
+        const oqW2 = createWorker();
+        await waitForWorkerReady(oqW2);
+        const oqSab2 = new SharedArrayBuffer(131072);
+        const oqWriter2 = new SABPipe('w', oqSab2);
+        const oqPromise2 = runWorkerTest(oqW2, 'test_overflow_cb_prevent', oqSab2, { queueLimit: 3, testTimeout: 5000 });
+        await new Promise(r => setTimeout(r, 50));
+        for (let i = 0; i < 10; i++) {
+          oqWriter2.postMessage({ id: i });
+        }
+        await new Promise(r => setTimeout(r, 100));
+        oqWriter2.destroy();
+        const oqResult2 = await oqPromise2;
+        assertEqual('onQueueOverflow prevent read: count', oqResult2.count, 3);
+        oqW2.terminate();
+      }
+
+      // onQueueOverflow — no callback = silent truncation
+      {
+        const sab = new SharedArrayBuffer(131072);
+        const writer = new SABPipe('w', sab, 0, null, 3);
+        test('onQueueOverflow default null', writer.onQueueOverflow === null);
+        for (let i = 0; i < 5; i++) writer.postMessage({ id: i });
+        test('onQueueOverflow null: no error', true);
+        writer.destroy();
+      }
+
+      // onQueueOverflow — SABMessagePort delegation
+      {
+        const port = new SABMessagePort('a', 256, 5);
+        const handler = (q) => {};
+        port.onQueueOverflow = handler;
+        test('onQueueOverflow SABMessagePort: getter', port.onQueueOverflow === handler);
+        port.onQueueOverflow = null;
+        test('onQueueOverflow SABMessagePort: reset', port.onQueueOverflow === null);
+        port.close();
+      }
+
+      // onQueueOverflow — MWChannel delegation
+      {
+        const mw = new MWChannel('m', 128, 5);
+        const handler = (q) => {};
+        mw.onQueueOverflow = handler;
+        test('onQueueOverflow MWChannel: getter', mw.onQueueOverflow === handler);
+        mw.onQueueOverflow = null;
+        test('onQueueOverflow MWChannel: reset', mw.onQueueOverflow === null);
+        mw.close();
+      }
+
+      // ─────────────────────────────────────────────────────────────
       group('Round-Trip Comparison');
       // ─────────────────────────────────────────────────────────────
 

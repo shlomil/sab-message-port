@@ -140,7 +140,7 @@ export class SABPipe {
   static RW_CAN_READ = 1;
 
 
-  constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null) {  // 128 KB default
+  constructor(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null, queueLimit = null) {  // 128 KB default
     this._sab = typeof sabOrSize === 'number'
         ? new SharedArrayBuffer(sabOrSize)
         : sabOrSize;
@@ -164,6 +164,8 @@ export class SABPipe {
       this._onmessage = null;
       this._messageLoopActive = false;
     } else throw new Error("Invalid role parameter: must be 'r' or 'w'");
+    this._queueLimit = queueLimit;
+    this._onQueueOverflow = null;
     this._max_chunk = size - SABPipe.DATA_OFFSET;
   }
 
@@ -200,6 +202,48 @@ export class SABPipe {
 
   close() {
     this.destroy();
+  }
+
+  get queueLimit() {
+    return this._queueLimit;
+  }
+
+  get onQueueOverflow() {
+    return this._onQueueOverflow;
+  }
+
+  set onQueueOverflow(handler) {
+    this._onQueueOverflow = handler ?? null;
+  }
+
+  set queueLimit(value) {
+    if (value !== null && (!Number.isInteger(value) || value < 0)) {
+      throw new Error('queueLimit must be null or a non-negative integer');
+    }
+    this._queueLimit = value;
+    if (value !== null) {
+      if (this.isWriter && this._write_queue.queue.length > value) {
+        if (this._onQueueOverflow) this._onQueueOverflow(this._write_queue.queue);
+        if (this._write_queue.queue.length > value) {
+          this._write_queue.queue.splice(0, this._write_queue.queue.length - value);
+        }
+      }
+      if (this.isReader && this._read_queue && this._read_queue.length > value) {
+        if (this._onQueueOverflow) this._onQueueOverflow(this._read_queue);
+        if (this._read_queue.length > value) {
+          this._read_queue.length = value;
+        }
+      }
+    }
+  }
+
+  _enforceQueueLimit() {
+    if (this._queueLimit !== null && this._read_queue.length > this._queueLimit) {
+      if (this._onQueueOverflow) this._onQueueOverflow(this._read_queue);
+      if (this._read_queue.length > this._queueLimit) {
+        this._read_queue.length = this._queueLimit;
+      }
+    }
   }
 
   _create_write_queue() {
@@ -440,6 +484,7 @@ export class SABPipe {
 
     // Prepend to read_queue (new messages at front, oldest at end)
     this._read_queue = messages.concat(this._read_queue);
+    this._enforceQueueLimit();
 
     return true;
   }
@@ -570,6 +615,7 @@ export class SABPipe {
       const messages = JSON.parse(_decoder.decode(payloadBytes));
       messages.reverse();
       this._read_queue = messages.concat(this._read_queue);
+      this._enforceQueueLimit();
 
       return true;
     } finally {
@@ -593,6 +639,14 @@ export class SABPipe {
 
     // Push message to queue
     this._write_queue.queue.push(jsonMessage);
+
+    // Enforce queue limit — discard oldest (front) messages
+    if (this._queueLimit !== null && this._write_queue.queue.length > this._queueLimit) {
+      if (this._onQueueOverflow) this._onQueueOverflow(this._write_queue.queue);
+      if (this._write_queue.queue.length > this._queueLimit) {
+        this._write_queue.queue.splice(0, this._write_queue.queue.length - this._queueLimit);
+      }
+    }
 
     // Save promise BEFORE _asyncWrite() might replace _write_queue
     const promise = this._write_queue.finishWritePromise;
@@ -753,7 +807,7 @@ export class SABPipe {
 
 export class SABMessagePort {
 
-  constructor(side = 'a', sabOrSizeKB = 256) {
+  constructor(side = 'a', sabOrSizeKB = 256, queueLimit = null) {
     if (side !== 'a' && side !== 'b') throw new Error("side must be 'a' or 'b'");
 
     this._sab = (typeof sabOrSizeKB === 'number')
@@ -763,19 +817,19 @@ export class SABMessagePort {
     const sectionSize = this._sab.byteLength / 2;
 
     if (side === 'a') {
-      this._writer = new SABPipe('w', this._sab, 0, sectionSize);
-      this._reader = new SABPipe('r', this._sab, sectionSize, sectionSize);
+      this._writer = new SABPipe('w', this._sab, 0, sectionSize, queueLimit);
+      this._reader = new SABPipe('r', this._sab, sectionSize, sectionSize, queueLimit);
     } else {
-      this._reader = new SABPipe('r', this._sab, 0, sectionSize);
-      this._writer = new SABPipe('w', this._sab, sectionSize, sectionSize);
+      this._reader = new SABPipe('r', this._sab, 0, sectionSize, queueLimit);
+      this._writer = new SABPipe('w', this._sab, sectionSize, sectionSize, queueLimit);
     }
   }
 
-  static from(initMsg) {
+  static from(initMsg, queueLimit = null) {
     if (initMsg?.type !== 'SABMessagePort') {
       throw new Error('Not a SABMessagePort init message');
     }
-    return new SABMessagePort('b', initMsg.buffer);
+    return new SABMessagePort('b', initMsg.buffer, queueLimit);
   }
 
   postInit(target = null, extraProps = {}) {
@@ -810,6 +864,24 @@ export class SABMessagePort {
     return this._reader.tryPeek();
   }
 
+  get queueLimit() {
+    return this._writer.queueLimit;
+  }
+
+  set queueLimit(value) {
+    this._writer.queueLimit = value;
+    this._reader.queueLimit = value;
+  }
+
+  get onQueueOverflow() {
+    return this._writer.onQueueOverflow;
+  }
+
+  set onQueueOverflow(handler) {
+    this._writer.onQueueOverflow = handler;
+    this._reader.onQueueOverflow = handler;
+  }
+
   close() {
     this._writer.destroy();
     this._reader.destroy();
@@ -838,18 +910,20 @@ export class MWChannel {
    * @param {'m'|'w'} side - 'm' (main thread) or 'w' (worker thread)
    * @param {number} sabSizeKB - SABPipe buffer size in KB (default 128). Main side only.
    */
-  constructor(side, sabSizeKB = 128) {
+  constructor(side, sabSizeKB = 128, queueLimit = null) {
     if (side !== 'm' && side !== 'w') throw new Error("side must be 'm' or 'w'");
     this._side = side;
     this._mode = 'blocking'; // default: worker starts in blocking mode
     this._onmessage = null;
     this._pendingDrain = [];
+    this._queueLimit = queueLimit;
+    this._onQueueOverflow = null;
 
     if (side === 'm') {
       this._sab = new SharedArrayBuffer(sabSizeKB * 1024);
       this._channel = new MessageChannel();
       this._nativePort = this._channel.port1;
-      this._sabWriter = new SABPipe('w', this._sab);
+      this._sabWriter = new SABPipe('w', this._sab, undefined, undefined, queueLimit);
     }
     // Worker side: _sab, _nativePort, _sabReader initialized by from()
   }
@@ -858,14 +932,15 @@ export class MWChannel {
    * Creates the worker side from a received init message.
    * @param {object} initMsg - Must have type='MWChannel', buffer, port
    */
-  static from(initMsg) {
+  static from(initMsg, queueLimit = null) {
     if (initMsg?.type !== 'MWChannel') {
       throw new Error('Not a MWChannel init message');
     }
     const mw = new MWChannel('w');
+    mw._queueLimit = queueLimit;
     mw._sab = initMsg.buffer;
     mw._nativePort = initMsg.port;
-    mw._sabReader = new SABPipe('r', mw._sab);
+    mw._sabReader = new SABPipe('r', mw._sab, undefined, undefined, queueLimit);
     mw._nativePort.start();
     return mw;
   }
@@ -992,8 +1067,50 @@ export class MWChannel {
         while ((msg = this._sabReader.tryRead()) !== null) {
           this._pendingDrain.push(msg);
         }
+        if (this._queueLimit !== null && this._pendingDrain.length > this._queueLimit) {
+          if (this._onQueueOverflow) this._onQueueOverflow(this._pendingDrain);
+          if (this._pendingDrain.length > this._queueLimit) {
+            this._pendingDrain.splice(0, this._pendingDrain.length - this._queueLimit);
+          }
+        }
         this._mode = 'nonblocking';
       }
+    }
+  }
+
+  get queueLimit() {
+    if (this._side === 'm') return this._sabWriter.queueLimit;
+    return this._sabReader.queueLimit;
+  }
+
+  set queueLimit(value) {
+    if (value !== null && (!Number.isInteger(value) || value < 0)) {
+      throw new Error('queueLimit must be null or a non-negative integer');
+    }
+    this._queueLimit = value;
+    if (this._side === 'm') {
+      this._sabWriter.queueLimit = value;
+    } else {
+      this._sabReader.queueLimit = value;
+    }
+    if (value !== null && this._pendingDrain.length > value) {
+      if (this._onQueueOverflow) this._onQueueOverflow(this._pendingDrain);
+      if (this._pendingDrain.length > value) {
+        this._pendingDrain.splice(0, this._pendingDrain.length - value);
+      }
+    }
+  }
+
+  get onQueueOverflow() {
+    return this._onQueueOverflow;
+  }
+
+  set onQueueOverflow(handler) {
+    this._onQueueOverflow = handler ?? null;
+    if (this._side === 'm') {
+      this._sabWriter.onQueueOverflow = handler;
+    } else if (this._sabReader) {
+      this._sabReader.onQueueOverflow = handler;
     }
   }
 

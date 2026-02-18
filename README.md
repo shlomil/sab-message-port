@@ -289,6 +289,36 @@ const msgs = port.tryRead(10);    // up to 10 messages (array, newest first) or 
 
 Non-blocking peek. Returns the next message without removing it from the queue. If the queue is empty, attempts a non-blocking read from the shared buffer first. Returns `null` if no data is available.
 
+### `port.queueLimit` (getter/setter)
+
+Optional per-queue message count limit. When the queue exceeds the limit, the **oldest** messages are silently discarded. Applies to both the internal write queue and read queue.
+
+- **`null`** (default): No limit — queues grow without bound.
+- **Non-negative integer**: Maximum number of messages allowed in each queue.
+- Setting a lower limit immediately trims the existing queue.
+
+```javascript
+const port = new SABMessagePort('a', 256, 5);  // queueLimit=5 via constructor
+port.queueLimit = 10;   // change at runtime
+port.queueLimit = null;  // disable
+```
+
+The third constructor parameter (`queueLimit`) sets the initial limit. `SABMessagePort.from(initMsg, queueLimit)` also accepts it.
+
+### `port.onQueueOverflow` (getter/setter)
+
+Callback invoked **before** a queue is truncated due to exceeding its `queueLimit`. Receives the overflowing queue array by reference — the callback can inspect, log, or modify it. After the callback returns, the queue is truncated only if it still exceeds the limit.
+
+```javascript
+port.onQueueOverflow = (queue) => {
+  console.warn(`Dropping ${queue.length - port.queueLimit} messages`);
+  // Or handle manually: queue.splice(0, queue.length - port.queueLimit);
+};
+```
+
+- **`null`** (default): No callback — overflow is silently truncated.
+- Propagates to both internal SABPipe instances (writer and reader).
+
 ### `port.close()`
 
 Disposes both directions. Unblocks any waiting readers/writers by signaling disposal. After closing, all `postMessage()`, `read()`, `asyncRead()`, and `tryRead()` calls will throw. Calling `close()` multiple times is safe (subsequent calls are no-ops).
@@ -305,7 +335,7 @@ Unidirectional channel — one end writes, the other reads. Used internally by `
 
 All messages must be **JSON-serializable**. Message ordering is **FIFO**.
 
-### `new SABPipe(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null)`
+### `new SABPipe(role, sabOrSize = 131072, byteOffset = 0, sectionSize = null, queueLimit = null)`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -313,6 +343,7 @@ All messages must be **JSON-serializable**. Message ordering is **FIFO**.
 | `sabOrSize` | `131072` | Byte size for a new buffer (128 KB), or an existing `SharedArrayBuffer`. |
 | `byteOffset` | `0` | Starting byte offset in the SAB. |
 | `sectionSize` | `null` | Section size in bytes. Defaults to the remaining SAB from `byteOffset`. |
+| `queueLimit` | `null` | Max messages in the queue. `null` = unlimited. When exceeded, oldest messages are discarded. |
 
 The writer and reader must share the same `SharedArrayBuffer` (and same offset/section) to communicate. Role enforcement is strict: the writer can only call `postMessage()`, and the reader can only call `read()`/`asyncRead()`/`tryRead()`/`onmessage`. Calling the wrong method throws.
 
@@ -381,6 +412,14 @@ Event-driven handler. Setting a function starts a continuous async read loop; se
 
 ### Shared
 
+#### `pipe.queueLimit` (getter/setter)
+
+Optional per-queue message count limit. See [`SABMessagePort.queueLimit`](#portqueuelimit-gettersetter) for details.
+
+#### `pipe.onQueueOverflow` (getter/setter)
+
+Callback invoked before queue truncation. See [`SABMessagePort.onQueueOverflow`](#portonqueueoverflow-gettersetter) for details.
+
 #### `pipe.close()` / `pipe.destroy()`
 
 Disposes the channel and unblocks any waiting readers/writers. After disposal, all read/write operations throw `'SABPipe disposed'`. Safe to call multiple times.
@@ -404,7 +443,7 @@ The worker can also switch between blocking (SABPipe) and non-blocking (MessageP
 - **Main→worker:** Uses SABPipe by default (enables `read()`/`tryRead()` on the worker). Can be switched to native `MessagePort` when blocking reads aren't needed.
 - The main thread **always receives via native `MessagePort`** and never blocks.
 
-### `new MWChannel(side, sabSizeKB = 128)`
+### `new MWChannel(side, sabSizeKB = 128, queueLimit = null)`
 
 Creates a new channel.
 
@@ -412,13 +451,14 @@ Creates a new channel.
 |-----------|---------|-------------|
 | `side` | (required) | `'m'` (main thread) or `'w'` (worker). Throws if invalid. |
 | `sabSizeKB` | `128` | SABPipe buffer size in KB. Main side only. |
+| `queueLimit` | `null` | Max messages in the queue. `null` = unlimited. |
 
 ```javascript
 const port = new MWChannel('m');         // 128 KB SABPipe buffer
 const port = new MWChannel('m', 256);   // 256 KB SABPipe buffer
 ```
 
-### `MWChannel.from(initMsg)`
+### `MWChannel.from(initMsg, queueLimit = null)`
 
 Creates the worker side from a received init message. The init message must have `type: 'MWChannel'`.
 
@@ -498,6 +538,14 @@ Switching to `'nonblocking'`:
 1. Worker sends an RPC to tell main which mode to use for sending.
 2. Main calls `port.setMode(newMode)` to switch its send transport.
 3. Worker calls `port.setMode(newMode)` to switch its receive transport.
+
+### `port.queueLimit` (getter/setter)
+
+Optional per-queue message count limit. Delegates to the underlying SABPipe (`_sabWriter` on main, `_sabReader` on worker). Also enforces on the `_pendingDrain` buffer during mode switches.
+
+### `port.onQueueOverflow` (getter/setter)
+
+Callback invoked before queue truncation. Delegates to the underlying SABPipe and also fires for `_pendingDrain` overflow. See [`SABMessagePort.onQueueOverflow`](#portonqueueoverflow-gettersetter) for details.
 
 ### `port.close()`
 
