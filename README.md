@@ -20,6 +20,14 @@ npm install sab-message-port
 import { SABMessagePort, SABPipe, MWChannel } from 'sab-message-port';
 ```
 
+A global build is also available for classic workers and `<script>` tags:
+
+```javascript
+// Classic worker (non-module)
+importScripts('sab-message-port/dist/SABMessagePort.global.min.js');
+const { SABMessagePort, SABPipe, MWChannel } = SABMessagePortLib;
+```
+
 ## Quick Start
 
 **Main thread:**
@@ -34,10 +42,13 @@ port.onmessage = (e) => console.log('from worker:', e.data);
 port.postMessage({ cmd: 'ping' });
 ```
 
-**Worker:**
+**Worker (classic/module):**
 
 ```javascript
-import { SABMessagePort } from 'sab-message-port';
+// import { SABMessagePort } from 'sab-message-port';  // module worker
+// or, for a classic worker:
+importScripts('sab-message-port/dist/SABMessagePort.global.min.js');
+const { SABMessagePort } = SABMessagePortLib;
 
 self.onmessage = (e) => {
   if (e.data.type === 'SABMessagePort') {
@@ -80,7 +91,10 @@ setTimeout(() => {
 **worker.js** — entirely synchronous, never yields to the event loop
 
 ```javascript
-import { SABMessagePort } from 'sab-message-port';
+// import { SABMessagePort } from 'sab-message-port';  // module worker
+// or, for a classic worker:
+importScripts('sab-message-port/dist/SABMessagePort.global.min.js');
+const { SABMessagePort } = SABMessagePortLib;
 
 self.onmessage = (e) => {
   if (e.data.type !== 'SABMessagePort') return;

@@ -1,6 +1,6 @@
 {
   "name": "sab-message-port",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Worker IPC over SharedArrayBuffer — blocking reads without the event loop",
   "type": "module",
   "exports": {
@@ -19,7 +19,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "esbuild src/SABMessagePort.js --bundle --format=esm --minify --outfile=dist/SABMessagePort.min.js",
+    "build": "esbuild src/SABMessagePort.js --bundle --format=esm --minify --outfile=dist/SABMessagePort.min.js && esbuild src/SABMessagePort.js --bundle --format=iife --global-name=SABMessagePortLib --minify --outfile=dist/SABMessagePort.global.min.js",
     "test": "node test/test.mjs",
     "prepublishOnly": "npm run build"
   },
