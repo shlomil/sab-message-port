@@ -1782,6 +1782,60 @@
       }
 
       // ─────────────────────────────────────────────────────────────
+      group('Global Build (classic worker)');
+      // ─────────────────────────────────────────────────────────────
+
+      // Classic worker — importScripts + SABPipe read/echo
+      {
+        const cw = new Worker('./worker-classic.js');  // no { type: 'module' }
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Classic worker ready timeout')), 5000);
+          const h = (e) => {
+            if (e.data.status === 'ready') { clearTimeout(t); cw.removeEventListener('message', h); resolve(); }
+          };
+          cw.addEventListener('message', h);
+        });
+
+        // SABPipe: write from main, read in classic worker
+        const cwSab = new SharedArrayBuffer(131072);
+        const cwWriter = new SABPipe('w', cwSab);
+        const cwResult = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Classic worker test timeout')), 5000);
+          const h = (e) => {
+            if (e.data.result !== undefined) { clearTimeout(t); cw.removeEventListener('message', h); resolve(e.data.result); }
+            if (e.data.status === 'error') { clearTimeout(t); reject(new Error(e.data.error)); }
+          };
+          cw.addEventListener('message', h);
+        });
+        cw.postMessage({ test: 'test_classic_read_echo', sab: cwSab, options: {} });
+        await new Promise(r => setTimeout(r, 50));
+        cwWriter.postMessage({ hello: 'from main' });
+        const cwEcho = await cwResult;
+        test('classic worker: loaded via importScripts', true);
+        test('classic worker: SABPipe read works', cwEcho.echo !== null);
+        assertEqual('classic worker: message content', cwEcho.echo.hello, 'from main');
+        test('classic worker: isReader correct', cwEcho.isReader === true);
+        test('classic worker: isWriter correct', cwEcho.isWriter === false);
+        cwWriter.destroy();
+
+        // SABMessagePort: bidirectional via classic worker
+        const cwSab2 = new SharedArrayBuffer(256 * 1024);
+        const cwPort = new SABMessagePort('a', cwSab2);
+        const cwBidiResult = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('Classic worker bidi timeout')), 5000);
+          cwPort.onmessage = (e) => { clearTimeout(t); resolve(e.data); };
+        });
+        cw.postMessage({ test: 'test_classic_bidi', sab: cwSab2, options: {} });
+        await new Promise(r => setTimeout(r, 50));
+        cwPort.postMessage({ ping: true });
+        const cwBidi = await cwBidiResult;
+        test('classic worker: SABMessagePort.from works', cwBidi.fromClassicWorker === true);
+        assertEqual('classic worker: bidi echo content', cwBidi.echo.ping, true);
+        cwPort.close();
+        cw.terminate();
+      }
+
+      // ─────────────────────────────────────────────────────────────
       group('Round-Trip Comparison');
       // ─────────────────────────────────────────────────────────────
 
